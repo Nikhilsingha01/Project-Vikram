@@ -2258,7 +2258,7 @@ class TestMetrics(unittest.TestCase):
         self.summarise_batch_metrics = summarise_batch_metrics
 
     def test_weights_defaults(self):
-        """MetricsWeights has correct defaults summing to 1.0."""
+        """MetricsWeights defaults sum to 1.0."""
         w = self.MetricsWeights()
         total = (
             w.evidence_weight
@@ -2274,66 +2274,749 @@ class TestMetrics(unittest.TestCase):
                                 reprojection_weight=0.0, spatial_uniformity_weight=0.0)
         self.assertAlmostEqual(w.evidence_weight, 0.5)
 
-    def test_compute_metrics_raises_not_implemented(self):
-        """compute_validation_metrics() raises NotImplementedError."""
+    def test_compute_metrics_is_callable(self):
+        """compute_validation_metrics() is callable with a gate_result."""
         from src.validation.evidence_gate import EvidenceGateResult
         gate_result = EvidenceGateResult(
-            passed=True,
-            rejection_reason=None,
-            evidence_score=0.7,
+            passed=True, rejection_reason=None, evidence_score=0.7,
         )
-        with self.assertRaises(NotImplementedError):
-            self.compute_validation_metrics(gate_result=gate_result)
+        # Without estimation_result gate passes but no estimation → REJECT
+        vm = self.compute_validation_metrics(gate_result=gate_result)
+        self.assertIsInstance(vm, self.ValidationMetrics)
 
-    def test_summarise_batch_raises_not_implemented(self):
-        """summarise_batch_metrics() raises NotImplementedError."""
-        with self.assertRaises(NotImplementedError):
+    def test_summarise_batch_raises_on_empty(self):
+        """summarise_batch_metrics() raises ValueError on empty list."""
+        with self.assertRaises(ValueError):
             self.summarise_batch_metrics(metrics_list=[])
 
     def test_validation_metrics_dataclass(self):
-        """ValidationMetrics can be constructed directly with minimal fields."""
+        """ValidationMetrics can be constructed directly with all fields."""
         vm = self.ValidationMetrics(
+            decision="ACCEPT",
             quality_score=0.82,
             passed=True,
             failure_stage=None,
             failure_reason=None,
             evidence_score=0.70,
-            inlier_count=45,
+            num_inliers=45,
             inlier_ratio=0.75,
-            inlier_rmse=2.3,
+            reprojection_rmse_px=2.3,
             spatial_uniformity=0.68,
             transform_model="HOMOGRAPHY",
         )
         self.assertTrue(vm.passed)
         self.assertAlmostEqual(vm.quality_score, 0.82)
         self.assertEqual(vm.transform_model, "HOMOGRAPHY")
+        self.assertEqual(vm.decision, "ACCEPT")
 
-    def test_to_dict_raises_not_implemented(self):
-        """ValidationMetrics.to_dict() raises NotImplementedError."""
-        vm = self.ValidationMetrics(
-            quality_score=0.0,
-            passed=False,
-            failure_stage="evidence_gate",
-            failure_reason="insufficient_matches",
+    def test_to_dict_returns_dict(self):
+        """ValidationMetrics.to_dict() returns a flat dict."""
+        from src.validation.evidence_gate import EvidenceGateResult
+        gate_result = EvidenceGateResult(
+            passed=True, rejection_reason=None, evidence_score=0.7,
         )
-        with self.assertRaises(NotImplementedError):
-            vm.to_dict()
+        vm = self.compute_validation_metrics(gate_result=gate_result)
+        d = vm.to_dict()
+        self.assertIsInstance(d, dict)
+        self.assertIn("decision", d)
+        self.assertIn("quality_score", d)
+        self.assertIn("passed", d)
 
-    def test_summary_string_raises_not_implemented(self):
-        """ValidationMetrics.summary_string() raises NotImplementedError."""
-        vm = self.ValidationMetrics(
-            quality_score=0.0,
-            passed=False,
-            failure_stage="evidence_gate",
-            failure_reason="insufficient_matches",
+    def test_summary_string_returns_string(self):
+        """ValidationMetrics.summary_string() returns a non-empty string."""
+        from src.validation.evidence_gate import EvidenceGateResult
+        gate_result = EvidenceGateResult(
+            passed=False, rejection_reason="insufficient_matches", evidence_score=0.1,
         )
-        with self.assertRaises(NotImplementedError):
-            vm.summary_string()
+        vm = self.compute_validation_metrics(gate_result=gate_result)
+        s = vm.summary_string()
+        self.assertIsInstance(s, str)
+        self.assertGreater(len(s), 0)
+        self.assertIn("REJECT", s)
 
 
 # ---------------------------------------------------------------------------
-# End-to-end pipeline skeleton test
+# Metrics algorithmic tests (Phase 6 — implemented)
 # ---------------------------------------------------------------------------
+
+
+def _make_gate_result(passed=True, evidence_score=0.8, rejection_reason=None):
+    """Build a minimal EvidenceGateResult for testing."""
+    from src.validation.evidence_gate import EvidenceGateResult
+    return EvidenceGateResult(
+        passed=passed,
+        rejection_reason=rejection_reason,
+        evidence_score=evidence_score,
+    )
+
+
+def _make_estimation_result(
+    success=True, n_inliers=40, n_outliers=10, inlier_ratio=0.80,
+    model_name="AFFINE", transform_matrix=None,
+):
+    """Build a minimal EstimationResult-like namespace for testing."""
+    import types
+    r = types.SimpleNamespace()
+    r.success = success
+    r.num_inliers = n_inliers
+    r.num_outliers = n_outliers
+    r.total_matches = n_inliers + n_outliers
+    r.inlier_ratio = inlier_ratio
+    r.reason = None if success else "ransac_failed"
+    r.failure_reason = r.reason
+    r.inlier_mask = np.ones(n_inliers + n_outliers, dtype=bool)
+    r.inlier_mask[n_inliers:] = False
+
+    # Model as simple namespace with .name attribute
+    r.model = types.SimpleNamespace(name=model_name)
+    if transform_matrix is None:
+        r.transform_matrix = np.eye(3, dtype=np.float64)
+    else:
+        r.transform_matrix = transform_matrix
+    return r
+
+
+def _make_inlier_report(inlier_count=40, outlier_count=10, spatial_coverage=0.75):
+    """Build a minimal InlierReport-like namespace for testing."""
+    import types
+    r = types.SimpleNamespace()
+    r.inlier_count = inlier_count
+    r.outlier_count = outlier_count
+    r.inlier_ratio = inlier_count / max(inlier_count + outlier_count, 1)
+    r.spatial_coverage = spatial_coverage
+    return r
+
+
+def _make_reprojection_report(
+    inlier_mean=1.5, inlier_median=1.2, inlier_rmse=1.8, inlier_max=4.0,
+):
+    """Build a minimal ReprojectionReport-like namespace for testing."""
+    import types
+    r = types.SimpleNamespace()
+    r.inlier_mean_error = inlier_mean
+    r.inlier_median_error = inlier_median
+    r.inlier_rmse = inlier_rmse
+    r.inlier_max_error = inlier_max
+    r.outlier_mean_error = 15.0
+    r.overall_rmse = 5.0
+    r.per_match_errors = np.ones(50, dtype=np.float64)
+    return r
+
+
+def _make_registration_result(warp_succeeded=True, overlap_sufficient=True):
+    """Build a minimal RegistrationResult-like namespace for testing."""
+    import types
+    r = types.SimpleNamespace()
+    r.registered_image = np.zeros((200, 200), dtype=np.uint8)
+    r.transform_matrix = np.eye(3, dtype=np.float64)
+    r.output_size = (200, 200)
+    r.overlap_bbox = (10, 10, 180, 180)
+    r.estimated_location = None
+    r.quality_flags = {
+        "warp_succeeded": warp_succeeded,
+        "overlap_nonzero": warp_succeeded,
+        "overlap_sufficient": overlap_sufficient,
+    }
+    r.diagnostics = {}
+    return r
+
+
+class TestMetricsImpl(unittest.TestCase):
+    """Algorithmic tests for compute_validation_metrics() (M3 Phase 6).
+
+    All tests are self-contained and do not depend on external data files.
+    They use simple namespace objects to simulate stage results so the tests
+    remain isolated from upstream implementation details.
+    """
+
+    def setUp(self):
+        from src.validation.metrics import (
+            MetricsWeights, DecisionThresholds, ValidationMetrics,
+            compute_validation_metrics, summarise_batch_metrics,
+            ACCEPT, REJECT,
+        )
+        self.MetricsWeights = MetricsWeights
+        self.DecisionThresholds = DecisionThresholds
+        self.ValidationMetrics = ValidationMetrics
+        self.compute = compute_validation_metrics
+        self.summarise = summarise_batch_metrics
+        self.ACCEPT = ACCEPT
+        self.REJECT = REJECT
+
+        # Default thresholds: lenient so basic happy-path tests pass
+        self.lenient = DecisionThresholds(
+            min_inlier_ratio=0.20,
+            min_inlier_count=4,
+            max_inlier_rmse_px=None,
+            require_warp_success=True,
+            require_overlap_sufficient=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Test 1: Gate required
+    # ------------------------------------------------------------------
+
+    def test_none_gate_result_raises_type_error(self):
+        """compute_validation_metrics raises TypeError when gate_result is None."""
+        with self.assertRaises(TypeError):
+            self.compute(gate_result=None)
+
+    # ------------------------------------------------------------------
+    # Test 2: Gate rejected → REJECT
+    # ------------------------------------------------------------------
+
+    def test_gate_rejected_produces_reject(self):
+        """When the evidence gate fails, decision is REJECT at stage evidence_gate."""
+        gate = _make_gate_result(passed=False, evidence_score=0.05,
+                                 rejection_reason="insufficient_matches")
+        vm = self.compute(gate_result=gate, thresholds=self.lenient)
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertFalse(vm.passed)
+        self.assertEqual(vm.failure_stage, "evidence_gate")
+        self.assertEqual(vm.failure_reason, "insufficient_matches")
+
+    # ------------------------------------------------------------------
+    # Test 3: Estimation failed → REJECT
+    # ------------------------------------------------------------------
+
+    def test_estimation_failure_produces_reject(self):
+        """When geometric estimation fails, decision is REJECT at stage geometric_estimation."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=False, n_inliers=2, n_outliers=8)
+        vm = self.compute(
+            gate_result=gate,
+            estimation_result=est,
+            thresholds=self.lenient,
+        )
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "geometric_estimation")
+
+    # ------------------------------------------------------------------
+    # Test 4: No estimation result (gate passed, nothing else) → REJECT
+    # ------------------------------------------------------------------
+
+    def test_no_estimation_result_produces_reject(self):
+        """No estimation_result with a passed gate still produces REJECT."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        vm = self.compute(gate_result=gate, thresholds=self.lenient)
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "geometric_estimation")
+
+    # ------------------------------------------------------------------
+    # Test 5: Low inlier ratio → REJECT
+    # ------------------------------------------------------------------
+
+    def test_low_inlier_ratio_produces_reject(self):
+        """Inlier ratio below threshold produces REJECT at stage inlier_ratio."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(
+            success=True, n_inliers=5, n_outliers=45, inlier_ratio=0.10,
+        )
+        thresh = self.DecisionThresholds(min_inlier_ratio=0.25, min_inlier_count=4)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=thresh)
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "inlier_ratio")
+
+    # ------------------------------------------------------------------
+    # Test 6: Insufficient inlier count → REJECT
+    # ------------------------------------------------------------------
+
+    def test_insufficient_inlier_count_produces_reject(self):
+        """Inlier count below threshold produces REJECT at stage inlier_count."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(
+            success=True, n_inliers=3, n_outliers=7, inlier_ratio=0.30,
+        )
+        thresh = self.DecisionThresholds(min_inlier_ratio=0.10, min_inlier_count=6)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=thresh)
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "inlier_count")
+
+    # ------------------------------------------------------------------
+    # Test 7: Excessive reprojection error → REJECT
+    # ------------------------------------------------------------------
+
+    def test_excessive_rmse_produces_reject(self):
+        """RMSE above max_inlier_rmse_px produces REJECT at stage reprojection_error."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        rep = _make_reprojection_report(inlier_rmse=15.0)
+        thresh = self.DecisionThresholds(
+            min_inlier_ratio=0.20, min_inlier_count=4,
+            max_inlier_rmse_px=5.0,   # 15 px exceeds 5 px limit
+        )
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            reprojection_report=rep, thresholds=thresh,
+        )
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "reprojection_error")
+
+    # ------------------------------------------------------------------
+    # Test 8: Failed warp → REJECT
+    # ------------------------------------------------------------------
+
+    def test_failed_warp_produces_reject(self):
+        """warp_succeeded=False with require_warp_success=True produces REJECT."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        reg = _make_registration_result(warp_succeeded=False)
+        thresh = self.DecisionThresholds(
+            min_inlier_ratio=0.20, min_inlier_count=4,
+            require_warp_success=True,
+        )
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            registration_result=reg, thresholds=thresh,
+        )
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "registration")
+
+    # ------------------------------------------------------------------
+    # Test 9: Insufficient overlap → REJECT (when required)
+    # ------------------------------------------------------------------
+
+    def test_insufficient_overlap_produces_reject_when_required(self):
+        """overlap_sufficient=False with require_overlap_sufficient=True → REJECT."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        reg = _make_registration_result(warp_succeeded=True, overlap_sufficient=False)
+        thresh = self.DecisionThresholds(
+            min_inlier_ratio=0.20, min_inlier_count=4,
+            require_warp_success=True, require_overlap_sufficient=True,
+        )
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            registration_result=reg, thresholds=thresh,
+        )
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "registration")
+
+    # ------------------------------------------------------------------
+    # Test 10: Successful full pipeline → ACCEPT
+    # ------------------------------------------------------------------
+
+    def test_full_pipeline_accept(self):
+        """All stages pass with good metrics → ACCEPT decision."""
+        gate = _make_gate_result(passed=True, evidence_score=0.85)
+        est = _make_estimation_result(success=True, n_inliers=48, n_outliers=12,
+                                      inlier_ratio=0.80)
+        inlier = _make_inlier_report(inlier_count=48, outlier_count=12,
+                                     spatial_coverage=0.75)
+        rep = _make_reprojection_report(inlier_rmse=1.8)
+        reg = _make_registration_result(warp_succeeded=True, overlap_sufficient=True)
+        thresh = self.DecisionThresholds(
+            min_inlier_ratio=0.25, min_inlier_count=4,
+            max_inlier_rmse_px=5.0,
+            require_warp_success=True, require_overlap_sufficient=False,
+        )
+        vm = self.compute(
+            gate_result=gate,
+            estimation_result=est,
+            inlier_report=inlier,
+            reprojection_report=rep,
+            registration_result=reg,
+            thresholds=thresh,
+        )
+        self.assertEqual(vm.decision, self.ACCEPT)
+        self.assertTrue(vm.passed)
+        self.assertIsNone(vm.failure_stage)
+        self.assertIsNone(vm.failure_reason)
+        self.assertGreater(vm.quality_score, 0.0)
+        self.assertLessEqual(vm.quality_score, 1.0)
+
+    # ------------------------------------------------------------------
+    # Test 11: Missing optional metrics (partial pipeline)
+    # ------------------------------------------------------------------
+
+    def test_missing_reprojection_report_still_accepts(self):
+        """Without reprojection report, RMSE-based fields are None (not zero)."""
+        gate = _make_gate_result(passed=True, evidence_score=0.85)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est, thresholds=self.lenient,
+        )
+        # Decision can be ACCEPT or REJECT depending on inlier counts
+        self.assertIsNone(vm.reprojection_rmse_px,
+                          "RMSE must be None when reprojection_report is absent.")
+        self.assertIsNone(vm.reprojection_mean_px)
+        self.assertIsNone(vm.reprojection_median_px)
+        self.assertIsNone(vm.reprojection_max_px)
+
+    def test_missing_inlier_report_spatial_uniformity_is_none(self):
+        """Without inlier_report, spatial_uniformity is None."""
+        gate = _make_gate_result(passed=True, evidence_score=0.85)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est, thresholds=self.lenient,
+        )
+        self.assertIsNone(vm.spatial_uniformity)
+
+    def test_missing_registration_result_warp_flags_are_none(self):
+        """Without registration_result, warp_succeeded and overlap_sufficient are None."""
+        gate = _make_gate_result(passed=True, evidence_score=0.85)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est, thresholds=self.lenient,
+        )
+        self.assertIsNone(vm.warp_succeeded)
+        self.assertIsNone(vm.overlap_sufficient)
+
+    # ------------------------------------------------------------------
+    # Test 12: Composite quality score properties
+    # ------------------------------------------------------------------
+
+    def test_quality_score_in_unit_interval(self):
+        """quality_score is always within [0, 1]."""
+        for evidence in (0.0, 0.5, 1.0):
+            for ir in (0.0, 0.5, 1.0):
+                gate = _make_gate_result(passed=True, evidence_score=evidence)
+                est = _make_estimation_result(
+                    success=True, n_inliers=int(40 * ir), n_outliers=int(40 * (1 - ir)),
+                    inlier_ratio=ir,
+                )
+                vm = self.compute(
+                    gate_result=gate, estimation_result=est, thresholds=self.lenient,
+                )
+                self.assertGreaterEqual(vm.quality_score, 0.0)
+                self.assertLessEqual(vm.quality_score, 1.0)
+
+    def test_quality_score_increases_with_better_inlier_ratio(self):
+        """Higher inlier_ratio produces higher quality_score (all else equal)."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est_low = _make_estimation_result(
+            success=True, n_inliers=10, n_outliers=40, inlier_ratio=0.20,
+        )
+        est_high = _make_estimation_result(
+            success=True, n_inliers=45, n_outliers=5, inlier_ratio=0.90,
+        )
+        vm_low = self.compute(
+            gate_result=gate, estimation_result=est_low, thresholds=self.lenient,
+        )
+        vm_high = self.compute(
+            gate_result=gate, estimation_result=est_high, thresholds=self.lenient,
+        )
+        self.assertGreater(vm_high.quality_score, vm_low.quality_score)
+
+    def test_custom_weights_change_score(self):
+        """Custom MetricsWeights change the composite score."""
+        gate = _make_gate_result(passed=True, evidence_score=0.0)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10,
+                                      inlier_ratio=0.80)
+        # With all weight on inlier_ratio, score should be ~0.80
+        w_inlier_only = self.MetricsWeights(
+            evidence_weight=0.0, inlier_ratio_weight=1.0,
+            reprojection_weight=0.0, spatial_uniformity_weight=0.0,
+        )
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            weights=w_inlier_only, thresholds=self.lenient,
+        )
+        self.assertAlmostEqual(vm.quality_score, 0.80, places=3)
+
+    # ------------------------------------------------------------------
+    # Test 13: Field values extracted correctly
+    # ------------------------------------------------------------------
+
+    def test_evidence_score_extracted(self):
+        """evidence_score is extracted from gate_result.evidence_score."""
+        gate = _make_gate_result(passed=True, evidence_score=0.72)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=self.lenient)
+        self.assertAlmostEqual(vm.evidence_score, 0.72, places=6)
+
+    def test_num_correspondences_extracted(self):
+        """num_correspondences is n_inliers + n_outliers."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=30, n_outliers=20)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=self.lenient)
+        self.assertEqual(vm.num_correspondences, 50)
+
+    def test_inlier_count_from_inlier_report_overrides_estimation(self):
+        """If inlier_report provides inlier_count, it overrides the estimation value."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        inlier = _make_inlier_report(inlier_count=38, outlier_count=12)  # slightly different
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            inlier_report=inlier, thresholds=self.lenient,
+        )
+        self.assertEqual(vm.num_inliers, 38)
+        self.assertEqual(vm.num_outliers, 12)
+
+    def test_reprojection_fields_extracted(self):
+        """All reprojection error fields are extracted from reprojection_report."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        rep = _make_reprojection_report(
+            inlier_mean=1.1, inlier_median=0.9, inlier_rmse=1.5, inlier_max=3.8,
+        )
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            reprojection_report=rep, thresholds=self.lenient,
+        )
+        self.assertAlmostEqual(vm.reprojection_mean_px, 1.1, places=5)
+        self.assertAlmostEqual(vm.reprojection_median_px, 0.9, places=5)
+        self.assertAlmostEqual(vm.reprojection_rmse_px, 1.5, places=5)
+        self.assertAlmostEqual(vm.reprojection_max_px, 3.8, places=5)
+
+    def test_warp_flags_extracted_from_registration(self):
+        """warp_succeeded and overlap_sufficient are extracted from registration_result."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        reg = _make_registration_result(warp_succeeded=True, overlap_sufficient=False)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            registration_result=reg, thresholds=self.lenient,
+        )
+        self.assertTrue(vm.warp_succeeded)
+        self.assertFalse(vm.overlap_sufficient)
+
+    # ------------------------------------------------------------------
+    # Test 14: to_dict() serialisation
+    # ------------------------------------------------------------------
+
+    def test_to_dict_contains_all_scalar_keys(self):
+        """to_dict() returns dict with all mandatory scalar keys."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=self.lenient)
+        d = vm.to_dict()
+        required_keys = [
+            "decision", "quality_score", "passed", "failure_stage", "failure_reason",
+            "evidence_score", "gate_passed", "num_correspondences",
+            "num_inliers", "num_outliers", "inlier_ratio",
+            "reprojection_rmse_px", "transform_model", "transform_valid",
+            "warp_succeeded",
+        ]
+        for key in required_keys:
+            self.assertIn(key, d, f"Missing key in to_dict(): {key}")
+
+    def test_to_dict_values_are_python_native(self):
+        """to_dict() returns Python-native (not numpy) values."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=self.lenient)
+        d = vm.to_dict()
+        for key, val in d.items():
+            if val is None:
+                continue
+            self.assertNotIsInstance(
+                val, (np.integer, np.floating, np.bool_),
+                f"Key '{key}' has numpy type {type(val).__name__}",
+            )
+
+    def test_to_dict_is_json_serialisable(self):
+        """to_dict() output can be serialised with json.dumps()."""
+        import json
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        rep = _make_reprojection_report(inlier_rmse=2.0)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            reprojection_report=rep, thresholds=self.lenient,
+        )
+        d = vm.to_dict()
+        # Should not raise
+        serialised = json.dumps(d)
+        self.assertIsInstance(serialised, str)
+
+    # ------------------------------------------------------------------
+    # Test 15: summary_string()
+    # ------------------------------------------------------------------
+
+    def test_summary_string_accept_format(self):
+        """ACCEPT summary_string contains ACCEPT, quality, inliers, RMSE, model."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        rep = _make_reprojection_report(inlier_rmse=2.3)
+        vm = self.compute(
+            gate_result=gate, estimation_result=est,
+            reprojection_report=rep, thresholds=self.lenient,
+        )
+        s = vm.summary_string()
+        self.assertIn("ACCEPT", s)
+        self.assertIn("quality=", s)
+        self.assertIn("inliers=", s)
+        self.assertIn("RMSE=", s)
+
+    def test_summary_string_reject_format(self):
+        """REJECT summary_string contains REJECT, stage, reason."""
+        gate = _make_gate_result(passed=False, evidence_score=0.05,
+                                 rejection_reason="low_confidence")
+        vm = self.compute(gate_result=gate, thresholds=self.lenient)
+        s = vm.summary_string()
+        self.assertIn("REJECT", s)
+        self.assertIn("stage=", s)
+        self.assertIn("reason=", s)
+        self.assertIn("low_confidence", s)
+
+    # ------------------------------------------------------------------
+    # Test 16: summarise_batch_metrics()
+    # ------------------------------------------------------------------
+
+    def test_batch_summarise_basic(self):
+        """summarise_batch_metrics returns correct counts and stats."""
+        gate_ok = _make_gate_result(passed=True, evidence_score=0.8)
+        gate_fail = _make_gate_result(passed=False, evidence_score=0.05,
+                                      rejection_reason="no_matches")
+        est_ok = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+
+        vm1 = self.compute(gate_result=gate_ok, estimation_result=est_ok,
+                           thresholds=self.lenient)
+        vm2 = self.compute(gate_result=gate_fail, thresholds=self.lenient)
+        vm3 = self.compute(gate_result=gate_ok, estimation_result=est_ok,
+                           thresholds=self.lenient)
+
+        summary = self.summarise([vm1, vm2, vm3])
+        self.assertEqual(summary["pass_count"] + summary["fail_count"], 3)
+        self.assertAlmostEqual(
+            summary["pass_rate"],
+            summary["pass_count"] / 3, places=6
+        )
+        self.assertGreaterEqual(summary["mean_quality"], 0.0)
+        self.assertLessEqual(summary["mean_quality"], 1.0)
+        self.assertIn("per_result", summary)
+        self.assertEqual(len(summary["per_result"]), 3)
+
+    def test_batch_empty_raises_value_error(self):
+        """summarise_batch_metrics raises ValueError on empty list."""
+        with self.assertRaises(ValueError):
+            self.summarise([])
+
+    def test_batch_single_item(self):
+        """summarise_batch_metrics works with a single-item list."""
+        gate = _make_gate_result(passed=True, evidence_score=0.8)
+        est = _make_estimation_result(success=True, n_inliers=40, n_outliers=10)
+        vm = self.compute(gate_result=gate, estimation_result=est, thresholds=self.lenient)
+        summary = self.summarise([vm])
+        self.assertEqual(len(summary["per_result"]), 1)
+        self.assertAlmostEqual(summary["pass_rate"], float(vm.passed))
+
+    # ------------------------------------------------------------------
+    # Test 17: End-to-end Phase 1 → Phase 6 with real M3 modules
+    # ------------------------------------------------------------------
+
+    def test_end_to_end_full_pipeline_accept(self):
+        """Full pipeline using real M3 modules: Phase 2→Phase 6 → ACCEPT.
+
+        Phase 1 (EvidenceGate.evaluate) is not yet implemented, so the gate
+        result is constructed directly from EvidenceGateResult.
+        """
+        from src.validation.evidence_gate import EvidenceGateResult
+        from src.validation.geometric_estimation import (
+            GeometricEstimator, GeometricEstimatorConfig, TransformModel,
+        )
+        from src.validation.inlier_analysis import analyse_inliers
+        from src.validation.reprojection import compute_reprojection_errors
+        from src.validation.registration import register_image, RegistrationConfig
+
+        # Build a strong synthetic correspondence (50 inliers, 5 outliers)
+        correspondence, true_M = _make_transformed_correspondence(
+            n_inliers=50, n_outliers=5, seed=42,
+        )
+
+        # Phase 1: Construct gate result directly (evaluate() not yet implemented)
+        gate_result = EvidenceGateResult(
+            passed=True, rejection_reason=None, evidence_score=0.85,
+        )
+
+        # Phase 2: Geometric estimation
+        est_cfg = GeometricEstimatorConfig(
+            model=TransformModel.AFFINE,
+            ransac_reproj_threshold=3.0,
+            min_inliers=4, min_inlier_ratio=0.0,
+        )
+        est_result = GeometricEstimator(config=est_cfg).estimate(correspondence)
+        self.assertTrue(est_result.success)
+
+        # Phase 3: Inlier analysis
+        inlier_report = analyse_inliers(
+            inlier_mask=est_result.inlier_mask,
+            source_points=correspondence["source_points"],
+            reference_points=correspondence["reference_points"],
+        )
+
+        # Phase 4: Reprojection
+        rep_report = compute_reprojection_errors(
+            source_points=correspondence["source_points"],
+            reference_points=correspondence["reference_points"],
+            transform_matrix=est_result.transform_matrix,
+            inlier_mask=est_result.inlier_mask,
+            model_type="affine",
+        )
+
+        # Phase 5: Registration
+        img_src, img_ref, _ = _make_synthetic_images()
+        reg_result = register_image(
+            source_image=img_src,
+            transform_matrix=est_result.transform_matrix,
+            reference_shape=img_ref.shape[:2],
+            config=RegistrationConfig(model_type="affine"),
+        )
+
+        # Phase 6: Metrics
+        thresh = self.DecisionThresholds(
+            min_inlier_ratio=0.20, min_inlier_count=4,
+            max_inlier_rmse_px=None, require_warp_success=True,
+        )
+        vm = self.compute(
+            gate_result=gate_result,
+            estimation_result=est_result,
+            inlier_report=inlier_report,
+            reprojection_report=rep_report,
+            registration_result=reg_result,
+            thresholds=thresh,
+        )
+
+        self.assertIsInstance(vm, self.ValidationMetrics)
+        self.assertEqual(vm.decision, self.ACCEPT)
+        self.assertTrue(vm.passed)
+        self.assertIsNone(vm.failure_stage)
+        self.assertIsNotNone(vm.inlier_ratio)
+        self.assertGreater(vm.inlier_ratio, 0.20)
+        self.assertIsNotNone(vm.reprojection_rmse_px)
+        self.assertLess(vm.reprojection_rmse_px, 3.5)
+        self.assertTrue(vm.warp_succeeded)
+        self.assertGreater(vm.quality_score, 0.0)
+
+        # Check summary string
+        s = vm.summary_string()
+        self.assertIn("ACCEPT", s)
+
+        # Check to_dict and JSON serialisability
+        import json
+        d = vm.to_dict()
+        self.assertEqual(d["decision"], self.ACCEPT)
+        json.dumps(d)  # must not raise
+
+    def test_end_to_end_gate_reject_pipeline(self):
+        """Pipeline with gate rejection propagates correctly through Phase 6.
+
+        Phase 1 (EvidenceGate.evaluate) is not yet implemented, so the gate
+        result is constructed directly from EvidenceGateResult.
+        """
+        from src.validation.evidence_gate import EvidenceGateResult
+
+        # Simulate a gate that rejected due to insufficient matches
+        gate_result = EvidenceGateResult(
+            passed=False,
+            rejection_reason="insufficient_matches",
+            evidence_score=0.05,
+        )
+        self.assertFalse(gate_result.passed)
+
+        vm = self.compute(gate_result=gate_result)
+        self.assertEqual(vm.decision, self.REJECT)
+        self.assertEqual(vm.failure_stage, "evidence_gate")
+        s = vm.summary_string()
+        self.assertIn("REJECT", s)
 
 
 class TestM3PipelineSkeleton(unittest.TestCase):
