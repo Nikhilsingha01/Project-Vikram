@@ -1765,6 +1765,43 @@ class TestReprojectionImpl(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Registration helpers and tests
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_images(
+    height: int = 200,
+    width: int = 200,
+    seed: int = 0,
+) -> tuple:
+    """Create a pair of uint8 synthetic grayscale images and a (2,3) affine matrix.
+
+    Returns:
+        Tuple (source_image, reference_image, affine_M) where:
+            source_image  : (H, W) uint8 ndarray
+            reference_image: (H, W) uint8 ndarray (random but same shape)
+            affine_M      : (2, 3) float64 affine matrix (5° rotation + 8px shift)
+    """
+    rng = np.random.RandomState(seed)
+    # Source: gradient pattern so warped content is visually distinct from fill
+    src = np.zeros((height, width), dtype=np.uint8)
+    for i in range(0, height, 20):
+        src[i:i + 10, :] = 128
+    src[40:160, 40:160] = 200  # bright square in centre
+
+    ref = rng.randint(50, 200, (height, width), dtype=np.uint8)
+
+    # 5° rotation + (8, -4) translation
+    angle = np.deg2rad(5.0)
+    c, s = np.cos(angle), np.sin(angle)
+    M = np.array([
+        [c, -s, 8.0],
+        [s,  c, -4.0],
+    ], dtype=np.float64)
+    return src, ref, M
+
+
+# ---------------------------------------------------------------------------
 # Registration tests
 # ---------------------------------------------------------------------------
 
@@ -1793,27 +1830,411 @@ class TestRegistration(unittest.TestCase):
         self.assertTrue(cfg.compute_overlap)
         self.assertIsNone(cfg.output_size)
 
-    def test_register_image_raises_not_implemented(self):
-        """register_image() raises NotImplementedError."""
-        with self.assertRaises(NotImplementedError):
-            self.register_image(
-                source_image=self.img_src,
-                transform_matrix=self.H,
-                reference_shape=self.img_ref.shape[:2],
-            )
+    def test_register_image_is_callable(self):
+        """register_image() is callable and returns a RegistrationResult."""
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.H,
+            reference_shape=self.img_ref.shape[:2],
+        )
+        self.assertIsInstance(result, self.RegistrationResult)
 
     def test_registration_result_dataclass(self):
-        """RegistrationResult can be constructed directly."""
+        """RegistrationResult can be constructed directly with all fields."""
         dummy_warped = np.zeros_like(self.img_ref)
         result = self.RegistrationResult(
             registered_image=dummy_warped,
             transform_matrix=self.H,
+            output_size=(200, 200),
             overlap_bbox=(10, 10, 180, 180),
             estimated_location=None,
             quality_flags={"warp_succeeded": True, "overlap_nonzero": True},
         )
         self.assertEqual(result.registered_image.shape, self.img_ref.shape)
+        self.assertEqual(result.output_size, (200, 200))
         self.assertTrue(result.quality_flags["warp_succeeded"])
+
+
+# ---------------------------------------------------------------------------
+# Registration algorithmic tests (Phase 5 — implemented)
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationImpl(unittest.TestCase):
+    """Algorithmic tests for register_image() (M3 Phase 5)."""
+
+    def setUp(self):
+        from src.validation.registration import (
+            RegistrationConfig, RegistrationResult, register_image,
+            _compute_overlap_bbox, _estimate_geographic_location,
+        )
+        self.RegistrationConfig = RegistrationConfig
+        self.RegistrationResult = RegistrationResult
+        self.register_image = register_image
+        self._compute_overlap_bbox = _compute_overlap_bbox
+        self._estimate_geographic_location = _estimate_geographic_location
+
+        self.img_src, self.img_ref, self.affine_M = _make_synthetic_images()
+        self.H = np.vstack([self.affine_M, [0.0, 0.0, 1.0]])
+        self.ref_shape = self.img_ref.shape[:2]   # (H, W)
+
+    # ------------------------------------------------------------------
+    # Test 1: Affine warp produces correct output shape
+    # ------------------------------------------------------------------
+
+    def test_affine_warp_output_shape(self):
+        """warpAffine output matches reference_shape."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertIsInstance(result, self.RegistrationResult)
+        self.assertEqual(result.registered_image.shape, self.img_ref.shape)
+        self.assertEqual(result.output_size, (self.ref_shape[1], self.ref_shape[0]))
+        self.assertTrue(result.quality_flags["warp_succeeded"])
+
+    def test_affine_warp_preserves_dtype(self):
+        """Warped image dtype matches source image dtype."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertEqual(result.registered_image.dtype, self.img_src.dtype)
+
+    # ------------------------------------------------------------------
+    # Test 2: Homography warp produces correct output shape
+    # ------------------------------------------------------------------
+
+    def test_homography_warp_output_shape(self):
+        """warpPerspective output matches reference_shape."""
+        cfg = self.RegistrationConfig(model_type="homography")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.H,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertEqual(result.registered_image.shape, self.img_ref.shape)
+        self.assertTrue(result.quality_flags["warp_succeeded"])
+
+    # ------------------------------------------------------------------
+    # Test 3: Identity transform → warped image == source
+    # ------------------------------------------------------------------
+
+    def test_identity_affine_preserves_image(self):
+        """Identity (2,3) affine leaves source image unchanged."""
+        I_affine = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=I_affine,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        # With identity, registered image should equal source (same shape)
+        np.testing.assert_array_equal(
+            result.registered_image, self.img_src,
+            err_msg="Identity affine must produce pixel-identical output.",
+        )
+
+    def test_identity_homography_preserves_image(self):
+        """Identity (3,3) homography leaves source image unchanged."""
+        I_hom = np.eye(3, dtype=np.float64)
+        cfg = self.RegistrationConfig(model_type="homography")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=I_hom,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        np.testing.assert_array_equal(result.registered_image, self.img_src)
+
+    # ------------------------------------------------------------------
+    # Test 4: Custom output_size override
+    # ------------------------------------------------------------------
+
+    def test_custom_output_size(self):
+        """config.output_size overrides reference_shape for canvas dimensions."""
+        target_w, target_h = 320, 240
+        cfg = self.RegistrationConfig(
+            model_type="affine",
+            output_size=(target_w, target_h),
+        )
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertEqual(result.registered_image.shape[0], target_h)
+        self.assertEqual(result.registered_image.shape[1], target_w)
+        self.assertEqual(result.output_size, (target_w, target_h))
+
+    # ------------------------------------------------------------------
+    # Test 5: Overlap bounding box
+    # ------------------------------------------------------------------
+
+    def test_overlap_bbox_present_on_valid_warp(self):
+        """overlap_bbox is not None when the warped image has non-fill pixels."""
+        cfg = self.RegistrationConfig(model_type="affine", compute_overlap=True)
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertIsNotNone(result.overlap_bbox)
+        x, y, w, h = result.overlap_bbox
+        self.assertGreater(w, 0)
+        self.assertGreater(h, 0)
+        # Bbox must be inside canvas
+        out_w, out_h = result.output_size
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + w, out_w)
+        self.assertLessEqual(y + h, out_h)
+
+    def test_overlap_bbox_none_when_disabled(self):
+        """overlap_bbox is None when compute_overlap=False."""
+        cfg = self.RegistrationConfig(model_type="affine", compute_overlap=False)
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertIsNone(result.overlap_bbox)
+
+    def test_overlap_bbox_helper_none_on_black_image(self):
+        """_compute_overlap_bbox returns None for an all-zero (fill) image."""
+        black = np.zeros((100, 100), dtype=np.uint8)
+        self.assertIsNone(self._compute_overlap_bbox(black, fill_value=0))
+
+    def test_overlap_bbox_helper_detects_valid_region(self):
+        """_compute_overlap_bbox correctly locates a bright rectangle."""
+        img = np.zeros((100, 100), dtype=np.uint8)
+        img[20:60, 30:80] = 255
+        bbox = self._compute_overlap_bbox(img, fill_value=0)
+        self.assertIsNotNone(bbox)
+        x, y, w, h = bbox
+        self.assertEqual(y, 20)
+        self.assertEqual(x, 30)
+        self.assertEqual(h, 40)
+        self.assertEqual(w, 50)
+
+    # ------------------------------------------------------------------
+    # Test 6: Invalid inputs raise appropriate errors
+    # ------------------------------------------------------------------
+
+    def test_non_array_source_raises_type_error(self):
+        """Passing a list as source_image raises TypeError."""
+        with self.assertRaises(TypeError):
+            self.register_image(
+                source_image=[[0, 1], [2, 3]],  # list, not ndarray
+                transform_matrix=self.H,
+                reference_shape=self.ref_shape,
+            )
+
+    def test_wrong_homography_shape_raises_value_error(self):
+        """(2,3) matrix for homography raises ValueError."""
+        cfg = self.RegistrationConfig(model_type="homography")
+        with self.assertRaises(ValueError):
+            self.register_image(
+                source_image=self.img_src,
+                transform_matrix=self.affine_M,   # (2,3), wrong for homography
+                reference_shape=self.ref_shape,
+                config=cfg,
+            )
+
+    def test_wrong_affine_shape_raises_value_error(self):
+        """(3,3) matrix for affine raises ValueError."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        with self.assertRaises(ValueError):
+            self.register_image(
+                source_image=self.img_src,
+                transform_matrix=self.H,   # (3,3), wrong for affine
+                reference_shape=self.ref_shape,
+                config=cfg,
+            )
+
+    def test_unknown_model_type_raises_value_error(self):
+        """Unknown model_type string raises ValueError."""
+        cfg = self.RegistrationConfig(model_type="unknown_model")
+        with self.assertRaises(ValueError):
+            self.register_image(
+                source_image=self.img_src,
+                transform_matrix=self.affine_M,
+                reference_shape=self.ref_shape,
+                config=cfg,
+            )
+
+    def test_nan_transform_raises_value_error(self):
+        """NaN in transform_matrix raises ValueError."""
+        bad = self.affine_M.copy()
+        bad[0, 0] = np.nan
+        cfg = self.RegistrationConfig(model_type="affine")
+        with self.assertRaises(ValueError):
+            self.register_image(
+                source_image=self.img_src,
+                transform_matrix=bad,
+                reference_shape=self.ref_shape,
+                config=cfg,
+            )
+
+    def test_1d_source_raises_value_error(self):
+        """1-D source_image raises ValueError."""
+        bad_img = np.zeros(100, dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            self.register_image(
+                source_image=bad_img,
+                transform_matrix=self.H,
+                reference_shape=self.ref_shape,
+            )
+
+    # ------------------------------------------------------------------
+    # Test 7: Geographic localisation
+    # ------------------------------------------------------------------
+
+    def test_geographic_location_populated_when_gsd_provided(self):
+        """estimated_location is not None when reference_gsd is provided."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+            reference_gsd=0.5,  # 0.5 m/px
+        )
+        self.assertIsNotNone(result.estimated_location)
+        loc = result.estimated_location
+        self.assertIn("reference_pixel_x", loc)
+        self.assertIn("reference_pixel_y", loc)
+        self.assertIn("estimated_x_offset_m", loc)
+        self.assertIn("estimated_y_offset_m", loc)
+        self.assertAlmostEqual(loc["gsd_m_per_px"], 0.5)
+
+    def test_geographic_location_none_when_no_gsd(self):
+        """estimated_location is None when reference_gsd is not provided."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertIsNone(result.estimated_location)
+
+    def test_gsd_helper_identity_projects_centre(self):
+        """_estimate_geographic_location: identity homography maps centre to itself."""
+        h, w = 200, 200
+        loc = self._estimate_geographic_location(
+            np.eye(3, dtype=np.float64),
+            source_shape=(h, w),
+            reference_gsd=1.0,
+            model_type="homography",
+        )
+        self.assertAlmostEqual(loc["reference_pixel_x"], w / 2, places=6)
+        self.assertAlmostEqual(loc["reference_pixel_y"], h / 2, places=6)
+        self.assertAlmostEqual(loc["estimated_x_offset_m"], w / 2, places=6)
+
+    # ------------------------------------------------------------------
+    # Test 8: Quality flags
+    # ------------------------------------------------------------------
+
+    def test_quality_flags_structure(self):
+        """quality_flags contains the three expected boolean keys."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        for key in ("warp_succeeded", "overlap_nonzero", "overlap_sufficient"):
+            self.assertIn(key, result.quality_flags)
+            self.assertIsInstance(result.quality_flags[key], bool)
+        self.assertTrue(result.quality_flags["warp_succeeded"])
+        self.assertTrue(result.quality_flags["overlap_nonzero"])
+
+    # ------------------------------------------------------------------
+    # Test 9: Diagnostics dict
+    # ------------------------------------------------------------------
+
+    def test_diagnostics_populated(self):
+        """diagnostics dict is returned with key metadata."""
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        diag = result.diagnostics
+        self.assertIn("model_type", diag)
+        self.assertIn("fill_ratio", diag)
+        self.assertIn("overlap_ratio", diag)
+        self.assertGreaterEqual(diag["fill_ratio"], 0.0)
+        self.assertLessEqual(diag["fill_ratio"], 1.0)
+
+    # ------------------------------------------------------------------
+    # Test 10: Colour (3-channel) image
+    # ------------------------------------------------------------------
+
+    def test_colour_image_affine_warp(self):
+        """register_image works with (H, W, 3) colour images."""
+        colour_src = np.stack([self.img_src] * 3, axis=2)  # (H, W, 3)
+        cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=colour_src,
+            transform_matrix=self.affine_M,
+            reference_shape=self.ref_shape,
+            config=cfg,
+        )
+        self.assertEqual(result.registered_image.ndim, 3)
+        self.assertEqual(result.registered_image.shape[2], 3)
+        self.assertEqual(
+            result.registered_image.shape[:2], (self.ref_shape[0], self.ref_shape[1])
+        )
+
+    # ------------------------------------------------------------------
+    # Test 11: End-to-end Phase 2 → Phase 5
+    # ------------------------------------------------------------------
+
+    def test_end_to_end_phase2_to_phase5(self):
+        """Full pipeline: GeometricEstimator → register_image."""
+        from src.validation.geometric_estimation import (
+            GeometricEstimator, GeometricEstimatorConfig, TransformModel,
+        )
+        correspondence, true_M = _make_transformed_correspondence(
+            n_inliers=50, n_outliers=5, seed=33,
+        )
+        cfg_est = GeometricEstimatorConfig(
+            model=TransformModel.AFFINE,
+            ransac_reproj_threshold=3.0,
+            min_inliers=4,
+            min_inlier_ratio=0.0,
+        )
+        est = GeometricEstimator(config=cfg_est).estimate(correspondence)
+        self.assertTrue(est.success, f"Phase 2 failed: {est.reason}")
+
+        reg_cfg = self.RegistrationConfig(model_type="affine")
+        result = self.register_image(
+            source_image=self.img_src,
+            transform_matrix=est.transform_matrix,
+            reference_shape=self.ref_shape,
+            config=reg_cfg,
+        )
+        self.assertIsInstance(result, self.RegistrationResult)
+        self.assertTrue(result.quality_flags["warp_succeeded"])
+        self.assertEqual(result.registered_image.shape, self.img_src.shape)
+        self.assertIsNotNone(result.overlap_bbox)
+
 
 
 # ---------------------------------------------------------------------------
