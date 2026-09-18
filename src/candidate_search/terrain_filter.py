@@ -4,6 +4,7 @@ Filters weak, low-texture, or redundant candidate regions using structural compl
 edge density, variance tests, and Non-Maximum Suppression (NMS).
 """
 
+import logging
 from typing import Any, Dict, List, Sequence, Tuple
 import cv2
 import numpy as np
@@ -14,6 +15,8 @@ from src.structure.edges import (
     extract_canny_edges,
 )
 from src.structure.gradients import validate_grayscale
+
+logger = logging.getLogger(__name__)
 
 
 def compute_iou(bbox_a: Tuple[int, int, int, int], bbox_b: Tuple[int, int, int, int]) -> float:
@@ -113,11 +116,22 @@ def filter_candidate_regions(
     ref_gray = validate_grayscale(reference_image)
     ref_h, ref_w = ref_gray.shape[:2]
 
+    logger.info(
+        "Candidate filtering thresholds: min_score=%.4f, min_edge_density=%.6f, min_variance=%.2f, nms_iou_threshold=%.2f, max_candidates=%d",
+        min_score,
+        min_edge_density,
+        min_variance,
+        nms_iou_threshold,
+        max_candidates,
+    )
+    logger.info("Number of candidates before filtering: %d", len(candidates))
+
     valid_candidates: List[Dict[str, Any]] = []
 
     for cand in candidates:
         score = cand.get("score", 0.0)
         if score < min_score:
+            logger.debug("Candidate at %s rejected: score %.4f < min_score %.4f", cand.get("bbox"), score, min_score)
             continue
 
         x, y, w, h = cand["bbox"]
@@ -129,11 +143,13 @@ def filter_candidate_regions(
         y2 = min(ref_h, y + h)
 
         if (x2 - x1) < 16 or (y2 - y1) < 16:
+            logger.debug("Candidate at %s rejected: clipped size (%d, %d) < 16", cand.get("bbox"), x2 - x1, y2 - y1)
             continue
 
         roi = ref_gray[y1:y2, x1:x2]
         var = float(np.var(roi))
         if var < min_variance:
+            logger.debug("Candidate at %s rejected: variance %.2f < min_variance %.2f", (x1, y1, x2 - x1, y2 - y1), var, min_variance)
             continue
 
         # Check edge density in candidate ROI with dynamic auto-thresholds
@@ -141,6 +157,7 @@ def filter_candidate_regions(
         roi_edges = extract_auto_canny_edges(roi_norm)
         edge_density = compute_edge_density(roi_edges)
         if edge_density < min_edge_density:
+            logger.debug("Candidate at %s rejected: edge_density %.6f < min_edge_density %.6f", (x1, y1, x2 - x1, y2 - y1), edge_density, min_edge_density)
             continue
 
         cand_copy = dict(cand)
@@ -149,8 +166,15 @@ def filter_candidate_regions(
         cand_copy["clipped_bbox"] = (x1, y1, x2 - x1, y2 - y1)
         valid_candidates.append(cand_copy)
 
+    logger.info(
+        "Number of candidates passing attribute filters (before NMS): %d",
+        len(valid_candidates),
+    )
+
     # Apply NMS to suppress overlapping ROIs
     final_candidates = apply_nms(valid_candidates, iou_threshold=nms_iou_threshold, max_keep=max_candidates)
+
+    logger.info("Number of candidates after NMS: %d", len(final_candidates))
 
     # Assign 1-indexed rank / ROI IDs
     for idx, c in enumerate(final_candidates, start=1):

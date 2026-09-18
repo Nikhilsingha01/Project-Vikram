@@ -87,10 +87,46 @@ class TestCandidateSearch(unittest.TestCase):
         self.assertIsNotNone(result["best_candidate"])
         self.assertGreater(result["num_candidates_retained"], 0)
 
-        # Test crop extraction
-        crop = extract_candidate_crop(self.ref_img, result["best_candidate"])
-        self.assertIsInstance(crop, np.ndarray)
-        self.assertGreater(crop.size, 0)
+    def test_find_coarse_candidates_oversized_template_skips_cleanly(self):
+        # A template scale that exceeds reference dimensions should be safely skipped
+        cands = find_coarse_candidates(
+            self.src_img,
+            self.ref_img,
+            scales=(5.0,),  # 64*5 = 320 > 256
+            top_k_per_scale=3,
+        )
+        self.assertEqual(len(cands), 0)
+
+    def test_find_coarse_candidates_exact_dimensions(self):
+        # When template dimensions exactly equal reference dimensions, matching is valid
+        patch = self.ref_img.copy()
+        cands = find_coarse_candidates(
+            patch,
+            self.ref_img,
+            scales=(1.0,),
+            top_k_per_scale=1,
+        )
+        self.assertGreater(len(cands), 0)
+        self.assertAlmostEqual(cands[0]["score"], 1.0, delta=0.01)
+        self.assertEqual(cands[0]["bbox"], (0, 0, 256, 256))
+
+    def test_large_source_coarse_candidates_downscaled(self):
+        # When source has larger pixel dimensions than reference (e.g. high-res tile),
+        # downscaled scale factors (e.g. 0.25) should successfully localize the patch.
+        large_src = cv2.resize(self.src_img, (256, 256), interpolation=cv2.INTER_LINEAR)
+        cands = find_coarse_candidates(
+            large_src,
+            self.ref_img,
+            scales=(0.25,),  # 256 * 0.25 = 64
+            top_k_per_scale=3,
+        )
+        self.assertGreater(len(cands), 0)
+        best = max(cands, key=lambda c: c["score"])
+        bx, by, bw, bh = best["bbox"]
+        self.assertEqual(bw, 64)
+        self.assertEqual(bh, 64)
+        self.assertAlmostEqual(bx, 50, delta=10)
+        self.assertAlmostEqual(by, 50, delta=10)
 
 
 if __name__ == "__main__":

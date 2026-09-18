@@ -4,29 +4,40 @@ Orchestrates multi-scale coarse localization, structural terrain filtering,
 candidate ranking, and ROI extraction.
 """
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
 from src.candidate_search.coarse_localization import find_coarse_candidates
 from src.candidate_search.terrain_filter import filter_candidate_regions
+from src.ingestion.metadata import (
+    GSDValidationResult,
+    ImageMetadata,
+    calculate_physical_scale_ratio,
+)
 from src.structure.gradients import validate_grayscale
 from src.structure.structure_representation import (
     StructuralRepresentation,
     extract_structure_representation,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def generate_candidate_rois(
     source_image: Union[np.ndarray, StructuralRepresentation],
     reference_image: Union[np.ndarray, StructuralRepresentation],
-    scales: Sequence[float] = (0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0),
+    scales: Sequence[float] = (0.05, 0.1, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0),
     top_k_per_scale: int = 5,
     min_score: float = 0.15,
     min_edge_density: float = 0.005,
     min_variance: float = 5.0,
     nms_iou_threshold: float = 0.4,
     max_candidates: int = 5,
+    source_gsd: Optional[Union[float, ImageMetadata]] = None,
+    reference_gsd: Optional[Union[float, ImageMetadata]] = None,
+    gsd_validation: Optional[GSDValidationResult] = None,
 ) -> Dict[str, Any]:
     """Generate and rank candidate Regions of Interest (ROIs) from reference imagery.
 
@@ -40,6 +51,9 @@ def generate_candidate_rois(
         min_variance: Minimum pixel variance inside candidate ROI.
         nms_iou_threshold: NMS overlap threshold.
         max_candidates: Maximum number of ranked candidate ROIs to return.
+        source_gsd: Optional Ground Sample Distance of source image (m/px).
+        reference_gsd: Optional Ground Sample Distance of reference image (m/px).
+        gsd_validation: Optional pre-calculated GSDValidationResult.
 
     Returns:
         Dict[str, Any]: Structured search output containing:
@@ -47,7 +61,29 @@ def generate_candidate_rois(
             - 'total_raw_candidates': Total candidates found across all scales before filtering.
             - 'num_candidates_retained': Number of candidates surviving filtering.
             - 'best_candidate': Top-ranked candidate ROI dict (or None if no candidates found).
+            - 'gsd_validation': GSDValidationResult object (or None).
     """
+    # 0. GSD Validation and Scale Check
+    if gsd_validation is None and (source_gsd is not None or reference_gsd is not None):
+        gsd_validation = calculate_physical_scale_ratio(source_gsd, reference_gsd)
+
+    effective_scales = scales
+    if gsd_validation is not None and gsd_validation.is_valid:
+        if gsd_validation.is_extreme_scale_gap:
+            logger.warning(
+                "generate_candidate_rois: %s",
+                gsd_validation.warning_message,
+            )
+        elif gsd_validation.is_physically_suitable and gsd_validation.recommended_scales:
+            logger.info(
+                "generate_candidate_rois: Using GSD recommended scales %s based on physical scale ratio = %.4f",
+                gsd_validation.recommended_scales,
+                gsd_validation.scale_ratio,
+            )
+            # When physical GSD is known and suitable, focus search on physically consistent scales
+            if scales is None or list(scales) == [0.05, 0.08, 0.1, 0.125, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0] or list(scales) == [0.05, 0.1, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0]:
+                effective_scales = gsd_validation.recommended_scales
+
     # 1. Ensure structural representations
     if isinstance(source_image, StructuralRepresentation):
         src_rep = source_image
@@ -67,7 +103,7 @@ def generate_candidate_rois(
     raw_candidates = find_coarse_candidates(
         src_rep,
         ref_rep,
-        scales=scales,
+        scales=effective_scales,
         top_k_per_scale=top_k_per_scale,
     )
 
@@ -87,11 +123,19 @@ def generate_candidate_rois(
 
     best_candidate = filtered_candidates[0] if filtered_candidates else None
 
+    logger.info(
+        "generate_candidate_rois: Total raw candidates = %d, Retained candidates = %d, Best candidate score = %s",
+        len(raw_candidates),
+        len(filtered_candidates),
+        f"{best_candidate['score']:.6f}" if best_candidate else "None",
+    )
+
     return {
         "candidates": filtered_candidates,
         "total_raw_candidates": len(raw_candidates),
         "num_candidates_retained": len(filtered_candidates),
         "best_candidate": best_candidate,
+        "gsd_validation": gsd_validation,
     }
 
 

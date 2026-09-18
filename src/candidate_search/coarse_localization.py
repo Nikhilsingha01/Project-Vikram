@@ -4,6 +4,7 @@ Performs multi-scale structural cross-correlation between source and reference
 structural representations to identify promising candidate regions of interest.
 """
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
@@ -13,6 +14,8 @@ from src.structure.structure_representation import (
     StructuralRepresentation,
     extract_structure_representation,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def extract_search_representation(
@@ -41,7 +44,7 @@ def extract_search_representation(
 def find_coarse_candidates(
     source_rep: Union[np.ndarray, StructuralRepresentation],
     reference_rep: Union[np.ndarray, StructuralRepresentation],
-    scales: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0),
+    scales: Sequence[float] = (0.05, 0.1, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0),
     top_k_per_scale: int = 5,
     match_method: int = cv2.TM_CCOEFF_NORMED,
 ) -> List[Dict[str, Any]]:
@@ -67,17 +70,51 @@ def find_coarse_candidates(
     ref_h, ref_w = ref_comp.shape[:2]
     orig_src_h, orig_src_w = src_comp.shape[:2]
 
+    logger.info(
+        "Coarse candidate search: Reference dimensions (W=%d, H=%d), Source dimensions (W=%d, H=%d), scales=%s",
+        ref_w,
+        ref_h,
+        orig_src_w,
+        orig_src_h,
+        scales,
+    )
+
     candidates: List[Dict[str, Any]] = []
 
     for s in scales:
         if s <= 0:
+            logger.warning("Skipping non-positive scale: %f", s)
             continue
 
         target_w = int(orig_src_w * s)
         target_h = int(orig_src_h * s)
 
-        # Template cannot be larger than the reference image
-        if target_w >= ref_w or target_h >= ref_h or target_w < 16 or target_h < 16:
+        logger.info(
+            "Scale %.4f: Template dimensions (W=%d, H=%d)",
+            s,
+            target_w,
+            target_h,
+        )
+
+        # Template cannot be strictly larger than the reference image
+        if target_w > ref_w or target_h > ref_h:
+            logger.info(
+                "Scale %.4f: Template dimensions (W=%d, H=%d) exceed reference dimensions (W=%d, H=%d) - skipping scale.",
+                s,
+                target_w,
+                target_h,
+                ref_w,
+                ref_h,
+            )
+            continue
+
+        if target_w < 16 or target_h < 16:
+            logger.info(
+                "Scale %.4f: Template dimensions (W=%d, H=%d) are below minimum 16x16 - skipping scale.",
+                s,
+                target_w,
+                target_h,
+            )
             continue
 
         resized_src = cv2.resize(
@@ -85,6 +122,17 @@ def find_coarse_candidates(
         )
 
         res = cv2.matchTemplate(ref_comp, resized_src, match_method)
+
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        max_score = float(1.0 - min_val if match_method in (cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED) else max_val)
+
+        logger.info(
+            "Scale %.4f: Correlation map dimensions (H=%d, W=%d), Max correlation score = %.6f",
+            s,
+            res.shape[0],
+            res.shape[1],
+            max_score,
+        )
 
         # Flatten and extract top-k peak coordinates
         res_copy = res.copy()
@@ -122,4 +170,5 @@ def find_coarse_candidates(
             else:
                 res_copy[y1:y2, x1:x2] = -float("inf")
 
+    logger.info("Total raw candidates found across all scales: %d", len(candidates))
     return candidates
