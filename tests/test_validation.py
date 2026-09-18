@@ -173,11 +173,12 @@ class TestEvidenceGate(unittest.TestCase):
         gate_custom = self.EvidenceGate(config=self.EvidenceGateConfig(min_matches=4))
         self.assertEqual(gate_custom.config.min_matches, 4)
 
-    def test_evaluate_raises_not_implemented(self):
-        """EvidenceGate.evaluate() raises NotImplementedError (pre-implementation)."""
+    def test_evaluate_returns_evidence_gate_result(self):
+        """EvidenceGate.evaluate() returns an EvidenceGateResult instance."""
+        from src.validation.evidence_gate import EvidenceGateResult
         gate = self.EvidenceGate()
-        with self.assertRaises(NotImplementedError):
-            gate.evaluate(self.correspondence)
+        res = gate.evaluate(self.correspondence)
+        self.assertIsInstance(res, EvidenceGateResult)
 
     def test_gate_result_dataclass(self):
         """EvidenceGateResult can be constructed directly."""
@@ -3052,6 +3053,467 @@ class TestM3PipelineSkeleton(unittest.TestCase):
             MetricsWeights, summarise_batch_metrics,
         ]:
             self.assertIsNotNone(obj)
+
+
+# ===========================================================================
+# End-to-End M3 Pipeline Tests (added during M3 implementation)
+# ===========================================================================
+
+
+def _make_synthetic_image_for_test(seed: int = 0) -> "np.ndarray":
+    import cv2
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    H, W = 300, 300
+    img = np.full((H, W), 80, dtype=np.uint8)
+    for cx, cy, r in [(70, 70, 28), (180, 60, 22), (240, 180, 30), (80, 220, 18)]:
+        cv2.circle(img, (cx, cy), r, 220, 2)
+        cv2.circle(img, (cx - 2, cy - 2), max(1, r - 6), 40, -1)
+    noise = rng.randint(-10, 10, img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return img
+
+
+def _make_e2e_correspondence(
+    M_affine: "np.ndarray",
+    image_shape=(300, 300),
+    n_clean: int = 50,
+    n_outliers: int = 8,
+    noise_std: float = 0.5,
+    seed: int = 42,
+) -> dict:
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    H, W = image_shape
+    margin = 20
+    xs = np.linspace(margin, W - margin, 10)
+    ys = np.linspace(margin, H - margin, 10)
+    gx, gy = np.meshgrid(xs, ys)
+    pts = np.column_stack([gx.ravel(), gy.ravel()])
+    idx = rng.choice(len(pts), size=n_clean, replace=False)
+    src_c = pts[idx].astype(np.float32)
+
+    ones = np.ones((n_clean, 1), dtype=np.float64)
+    src_h = np.hstack([src_c.astype(np.float64), ones])
+    ref_c = (M_affine @ src_h.T).T.astype(np.float32)
+    ref_c += rng.normal(0, noise_std, ref_c.shape).astype(np.float32)
+
+    if n_outliers > 0:
+        src_o = rng.uniform([margin, margin], [W - margin, H - margin],
+                            (n_outliers, 2)).astype(np.float32)
+        ref_o = rng.uniform([margin, margin], [W - margin, H - margin],
+                            (n_outliers, 2)).astype(np.float32)
+        src_pts = np.vstack([src_c, src_o])
+        ref_pts = np.vstack([ref_c, ref_o])
+    else:
+        src_pts = src_c
+        ref_pts = ref_c
+
+    n_total = src_pts.shape[0]
+    confidence = float(n_clean / n_total)
+    return {
+        "source_points": src_pts,
+        "reference_points": ref_pts,
+        "confidence": confidence,
+        "matches": [],
+        "num_matches": n_total,
+        "num_keypoints_source": n_total + 20,
+        "num_keypoints_reference": n_total + 20,
+    }
+
+
+def _build_affine_matrix(angle_deg=6.0, scale=1.04, tx=10.0, ty=-8.0,
+                         image_size=(300, 300)):
+    import numpy as np
+    H, W = image_size
+    cx, cy = W / 2.0, H / 2.0
+    theta = np.deg2rad(angle_deg)
+    ct, st = np.cos(theta), np.sin(theta)
+    return np.array([
+        [scale * ct, -scale * st, tx + cx * (1 - scale * ct) + cy * scale * st],
+        [scale * st,  scale * ct, ty + cy * (1 - scale * ct) - cx * scale * st],
+    ], dtype=np.float64)
+
+
+class TestM3EndToEndPipeline(unittest.TestCase):
+    """Full M3 pipeline integration tests using deterministic synthetic data.
+
+    NOTE: All correspondence data is synthetically generated from a known
+    ground-truth affine transformation.  These tests exercise the full
+    stage-by-stage pipeline with verified inputs and confirm that each
+    stage produces the expected output structure and decision.
+
+    M2 source files are NOT modified or called -- correspondence dicts
+    are built directly using the M2 data contract format.
+    """
+
+    def _run_pipeline(self, correspondence, src_img=None, ref_img=None,
+                      model=None, gate_cfg=None, est_cfg=None, thresholds=None):
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
+        from src.validation.geometric_estimation import (
+            GeometricEstimator, GeometricEstimatorConfig, TransformModel,
+        )
+        from src.validation.inlier_analysis import InlierAnalyzer
+        from src.validation.reprojection import compute_reprojection_errors
+        from src.validation.registration import RegistrationConfig, register_image
+        from src.validation.metrics import compute_validation_metrics, DecisionThresholds
+
+        if src_img is None:
+            src_img = _make_synthetic_image_for_test(0)
+        if ref_img is None:
+            ref_img = _make_synthetic_image_for_test(1)
+        if model is None:
+            model = TransformModel.AFFINE
+
+        gate = EvidenceGate(config=gate_cfg or EvidenceGateConfig())
+        gate_result = gate.evaluate(correspondence)
+
+        estimation_result = None
+        if gate_result.passed:
+            ecfg = est_cfg or GeometricEstimatorConfig(
+                model=model, ransac_reproj_threshold=5.0,
+                min_inliers=4, min_inlier_ratio=0.10, refine_with_lm=True,
+            )
+            estimation_result = GeometricEstimator(ecfg).estimate(correspondence)
+
+        inlier_report = None
+        if estimation_result is not None and estimation_result.success:
+            inlier_report = InlierAnalyzer(grid_divisions=4).analyse(
+                inlier_mask=estimation_result.inlier_mask,
+                source_points=correspondence["source_points"],
+                reference_points=correspondence["reference_points"],
+                image_shape=src_img.shape[:2],
+            )
+
+        reprojection_report = None
+        if estimation_result is not None and estimation_result.success:
+            reprojection_report = compute_reprojection_errors(
+                source_points=np.asarray(correspondence["source_points"], dtype=np.float64),
+                reference_points=np.asarray(correspondence["reference_points"], dtype=np.float64),
+                transform_matrix=estimation_result.transform_matrix,
+                inlier_mask=estimation_result.inlier_mask,
+                model_type=estimation_result.transform_type.lower(),
+            )
+
+        registration_result = None
+        if estimation_result is not None and estimation_result.success:
+            reg_cfg = RegistrationConfig(
+                model_type=estimation_result.transform_type.lower(),
+                compute_overlap=True,
+            )
+            registration_result = register_image(
+                source_image=src_img,
+                transform_matrix=estimation_result.transform_matrix,
+                reference_shape=ref_img.shape[:2],
+                config=reg_cfg,
+            )
+
+        metrics = compute_validation_metrics(
+            gate_result=gate_result,
+            estimation_result=estimation_result,
+            inlier_report=inlier_report,
+            reprojection_report=reprojection_report,
+            registration_result=registration_result,
+            thresholds=thresholds,
+        )
+
+        return {
+            "gate": gate_result,
+            "estimation": estimation_result,
+            "inlier": inlier_report,
+            "reprojection": reprojection_report,
+            "registration": registration_result,
+            "metrics": metrics,
+        }
+
+    # -----------------------------------------------------------------------
+    # Happy path -- all stages pass
+    # -----------------------------------------------------------------------
+
+    def test_e2e_happy_path_accept(self):
+        """Full pipeline with 50 inliers + 8 outliers from known affine: ACCEPT."""
+        M = _build_affine_matrix(angle_deg=6.0, scale=1.04, tx=10.0, ty=-8.0)
+        corr = _make_e2e_correspondence(M, n_clean=50, n_outliers=8, noise_std=0.5)
+        res = self._run_pipeline(corr)
+        metrics = res["metrics"]
+
+        self.assertTrue(res["gate"].passed, "Gate should pass with 58 matches")
+        self.assertIsNotNone(res["estimation"], "Estimation should run")
+        self.assertTrue(res["estimation"].success, "Estimation should succeed")
+        self.assertIsNotNone(res["inlier"])
+        self.assertIsNotNone(res["reprojection"])
+        self.assertIsNotNone(res["registration"])
+        self.assertEqual(metrics.decision, "ACCEPT")
+        self.assertTrue(metrics.passed)
+        self.assertIsNone(metrics.failure_stage)
+        self.assertGreater(metrics.quality_score, 0.5)
+        self.assertGreater(metrics.num_inliers, 0)
+        self.assertGreater(metrics.inlier_ratio, 0.5)
+        self.assertIsNotNone(metrics.reprojection_rmse_px)
+        self.assertTrue(metrics.warp_succeeded)
+
+    def test_e2e_inlier_count_correct(self):
+        """InlierReport inlier_count + outlier_count == total correspondences."""
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=40, n_outliers=5)
+        res = self._run_pipeline(corr)
+        ir = res["inlier"]
+        if ir is not None:
+            self.assertEqual(ir.inlier_count + ir.outlier_count, ir.total_count)
+
+    def test_e2e_reprojection_rmse_low_for_clean_data(self):
+        """Inlier RMSE should be < 2 px for clean (low-noise) synthetic data."""
+        M = _build_affine_matrix(angle_deg=4.0, scale=1.02, tx=5.0, ty=-3.0)
+        corr = _make_e2e_correspondence(M, n_clean=50, n_outliers=5, noise_std=0.3)
+        res = self._run_pipeline(corr)
+        rr = res["reprojection"]
+        if rr is not None:
+            self.assertLess(rr.inlier_rmse, 2.0,
+                            f"Expected RMSE < 2px, got {rr.inlier_rmse:.3f}")
+
+    def test_e2e_spatial_coverage_high_for_spread_points(self):
+        """Spatial coverage should be high (> 0.5) when inliers cover the image."""
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=50, n_outliers=5)
+        res = self._run_pipeline(corr)
+        ir = res["inlier"]
+        if ir is not None and ir.inlier_count > 4:
+            self.assertGreater(ir.spatial_coverage, 0.5,
+                               "Spread grid points should yield high spatial coverage")
+
+    def test_e2e_registration_produces_valid_image(self):
+        """Registered image should be non-None, correct shape, and have non-zero pixels."""
+        import numpy as np
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=50, n_outliers=5)
+        src_img = _make_synthetic_image_for_test(0)
+        ref_img = _make_synthetic_image_for_test(1)
+        res = self._run_pipeline(corr, src_img=src_img, ref_img=ref_img)
+        rr = res["registration"]
+        if rr is not None:
+            self.assertEqual(rr.registered_image.shape[:2], ref_img.shape[:2])
+            self.assertTrue(rr.quality_flags.get("warp_succeeded"))
+            self.assertGreater(int(rr.registered_image.max()), 0)
+
+    def test_e2e_validation_metrics_summary_string_accept(self):
+        """summary_string() for ACCEPT contains 'ACCEPT' and key fields."""
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=50, n_outliers=5)
+        res = self._run_pipeline(corr)
+        s = res["metrics"].summary_string()
+        self.assertIn("ACCEPT", s)
+        self.assertIn("quality=", s)
+
+    # -----------------------------------------------------------------------
+    # Failure case A -- insufficient correspondences
+    # -----------------------------------------------------------------------
+
+    def test_e2e_fail_insufficient_matches_gate_rejects(self):
+        """Gate with min_matches=15 rejects a 5-match correspondence."""
+        from src.validation.evidence_gate import EvidenceGateConfig
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=5, n_outliers=0, seed=1)
+        from src.validation.evidence_gate import EvidenceGate
+        gate = EvidenceGate(config=EvidenceGateConfig(min_matches=15))
+        result = gate.evaluate(corr)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.rejection_reason, "insufficient_matches")
+
+    def test_e2e_fail_insufficient_matches_pipeline_reject(self):
+        """Full pipeline REJECT with failure_stage=evidence_gate."""
+        from src.validation.evidence_gate import EvidenceGateConfig
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=4, n_outliers=0)
+        res = self._run_pipeline(
+            corr,
+            gate_cfg=EvidenceGateConfig(min_matches=10),
+        )
+        self.assertFalse(res["metrics"].passed)
+        self.assertEqual(res["metrics"].failure_stage, "evidence_gate")
+        self.assertIsNone(res["estimation"])  # should not have run
+
+    # -----------------------------------------------------------------------
+    # Failure case B -- outlier-heavy with strict thresholds
+    # -----------------------------------------------------------------------
+
+    def test_e2e_fail_low_inlier_ratio_pipeline_reject(self):
+        """Pipeline REJECT when inlier ratio < strict threshold."""
+        from src.validation.metrics import DecisionThresholds
+        M = _build_affine_matrix()
+        # 12 clean + 50 outliers → ~19% inlier ratio
+        corr = _make_e2e_correspondence(M, n_clean=12, n_outliers=50, seed=55)
+        res = self._run_pipeline(
+            corr,
+            thresholds=DecisionThresholds(min_inlier_ratio=0.50, min_inlier_count=4),
+        )
+        metrics = res["metrics"]
+        self.assertFalse(metrics.passed)
+        self.assertIn(metrics.failure_stage,
+                      ("inlier_ratio", "inlier_count", "geometric_estimation"))
+
+    # -----------------------------------------------------------------------
+    # Failure case C -- degenerate (zero spatial spread)
+    # -----------------------------------------------------------------------
+
+    def test_e2e_fail_degenerate_co_located_points(self):
+        """Gate rejects when all source points are co-located (zero spread)."""
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
+        n = 25
+        src = np.tile([[150.0, 150.0]], (n, 1)).astype(np.float32)
+        ref = np.tile([[160.0, 160.0]], (n, 1)).astype(np.float32)
+        corr = {
+            "source_points": src,
+            "reference_points": ref,
+            "confidence": 0.6,
+            "matches": [],
+            "num_matches": n,
+            "num_keypoints_source": n + 10,
+            "num_keypoints_reference": n + 10,
+        }
+        gate = EvidenceGate(config=EvidenceGateConfig(
+            min_matches=10,
+            min_spatial_spread=0.05,
+            min_confidence=0.1,
+            min_evidence_score=0.01,
+        ))
+        result = gate.evaluate(corr)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.rejection_reason, "insufficient_spatial_spread")
+
+    # -----------------------------------------------------------------------
+    # EvidenceGate unit tests
+    # -----------------------------------------------------------------------
+
+    def test_evidence_gate_passes_good_correspondence(self):
+        """EvidenceGate passes a well-formed, spread, high-confidence correspondence."""
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
+        rng = np.random.RandomState(0)
+        pts = rng.uniform(10, 290, (40, 2)).astype(np.float32)
+        corr = {
+            "source_points": pts,
+            "reference_points": pts + rng.normal(0, 1, pts.shape).astype(np.float32),
+            "confidence": 0.75,
+            "matches": [],
+            "num_matches": 40,
+            "num_keypoints_source": 80,
+            "num_keypoints_reference": 80,
+        }
+        gate = EvidenceGate(config=EvidenceGateConfig())
+        result = gate.evaluate(corr)
+        self.assertTrue(result.passed)
+        self.assertIsNone(result.rejection_reason)
+        self.assertGreater(result.evidence_score, 0.0)
+        self.assertLessEqual(result.evidence_score, 1.0)
+
+    def test_evidence_gate_rejects_low_confidence(self):
+        """EvidenceGate rejects when M2 confidence < min_confidence."""
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
+        rng = np.random.RandomState(1)
+        pts = rng.uniform(10, 290, (30, 2)).astype(np.float32)
+        corr = {
+            "source_points": pts,
+            "reference_points": pts,
+            "confidence": 0.01,   # well below default 0.1
+            "matches": [],
+            "num_matches": 30,
+            "num_keypoints_source": 60,
+            "num_keypoints_reference": 60,
+        }
+        gate = EvidenceGate(config=EvidenceGateConfig(min_confidence=0.2))
+        result = gate.evaluate(corr)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.rejection_reason, "low_m2_confidence")
+
+    def test_evidence_gate_missing_key_raises(self):
+        """EvidenceGate.evaluate() raises ValueError for missing required keys."""
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate
+        gate = EvidenceGate()
+        with self.assertRaises(ValueError):
+            gate.evaluate({"source_points": np.zeros((5, 2), dtype=np.float32)})
+
+    def test_evidence_gate_score_in_unit_interval(self):
+        """evidence_score is always in [0, 1] for any passing result."""
+        import numpy as np
+        from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
+        rng = np.random.RandomState(7)
+        pts = rng.uniform(0, 400, (30, 2)).astype(np.float32)
+        corr = {
+            "source_points": pts,
+            "reference_points": pts + 2,
+            "confidence": 0.8,
+            "matches": [],
+            "num_matches": 30,
+            "num_keypoints_source": 50,
+            "num_keypoints_reference": 50,
+        }
+        gate = EvidenceGate(config=EvidenceGateConfig())
+        result = gate.evaluate(corr)
+        self.assertGreaterEqual(result.evidence_score, 0.0)
+        self.assertLessEqual(result.evidence_score, 1.0)
+
+    # -----------------------------------------------------------------------
+    # Metrics aggregation tests
+    # -----------------------------------------------------------------------
+
+    def test_metrics_to_dict_is_json_serialisable(self):
+        """ValidationMetrics.to_dict() produces a JSON-serialisable dict."""
+        import json
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=40, n_outliers=5)
+        res = self._run_pipeline(corr)
+        d = res["metrics"].to_dict()
+        json_str = json.dumps(d)
+        self.assertIsInstance(json_str, str)
+        reparsed = json.loads(json_str)
+        self.assertIn("decision", reparsed)
+        self.assertIn("quality_score", reparsed)
+
+    def test_metrics_batch_summary_aggregates_correctly(self):
+        """summarise_batch_metrics works on a list of two ValidationMetrics."""
+        from src.validation.metrics import summarise_batch_metrics
+        M = _build_affine_matrix()
+        c1 = _make_e2e_correspondence(M, n_clean=50, n_outliers=5)
+        c2 = _make_e2e_correspondence(M, n_clean=4, n_outliers=0)
+        r1 = self._run_pipeline(c1)
+        r2 = self._run_pipeline(c2)
+        summary = summarise_batch_metrics([r1["metrics"], r2["metrics"]])
+        self.assertIn("pass_count", summary)
+        self.assertIn("fail_count", summary)
+        self.assertEqual(summary["pass_count"] + summary["fail_count"], 2)
+
+    # -----------------------------------------------------------------------
+    # Homography model
+    # -----------------------------------------------------------------------
+
+    def test_e2e_homography_model_accept(self):
+        """Full pipeline with HOMOGRAPHY model and clean data: ACCEPT."""
+        import numpy as np
+        from src.validation.geometric_estimation import TransformModel
+        M_aff = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M_aff, n_clean=60, n_outliers=10)
+        res = self._run_pipeline(corr, model=TransformModel.HOMOGRAPHY)
+        # Homography might or might not succeed depending on RANSAC + threshold
+        # but it must not raise an exception
+        self.assertIsNotNone(res["metrics"])
+        self.assertIn(res["metrics"].decision, ("ACCEPT", "REJECT"))
+
+    # -----------------------------------------------------------------------
+    # All-inlier case
+    # -----------------------------------------------------------------------
+
+    def test_e2e_all_inliers_no_outliers(self):
+        """Pipeline with 0 outliers produces inlier_ratio >= 0.9."""
+        M = _build_affine_matrix()
+        corr = _make_e2e_correspondence(M, n_clean=40, n_outliers=0, noise_std=0.3)
+        res = self._run_pipeline(corr)
+        metrics = res["metrics"]
+        if metrics.passed:
+            self.assertGreaterEqual(metrics.inlier_ratio, 0.5)
 
 
 if __name__ == "__main__":

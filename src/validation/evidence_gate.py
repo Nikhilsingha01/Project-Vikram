@@ -151,38 +151,98 @@ class EvidenceGate:
         Raises:
             ValueError: If required keys are missing from correspondence.
         """
-        # TODO (M3-EG-01): Validate that required M2 keys are present and
-        #   raise ValueError with a descriptive message for each missing key.
+        # ---- 1. Validate required M2 keys (M3-EG-01) -----------------------
+        self._validate_correspondence_keys(correspondence)
 
-        # TODO (M3-EG-02): Apply hard minimum-match-count gate.
-        #   If num_matches < config.min_matches, return immediately with
-        #   rejection_reason = "insufficient_matches".
+        num_matches: int = int(correspondence.get("num_matches", 0))
+        confidence: float = float(correspondence.get("confidence", 0.0))
+        source_points: np.ndarray = np.asarray(
+            correspondence["source_points"], dtype=np.float64
+        )
 
-        # TODO (M3-EG-03): Apply hard M2 confidence threshold gate.
-        #   If confidence < config.min_confidence, return with
-        #   rejection_reason = "low_m2_confidence".
+        # ---- 2. Hard: minimum match count (M3-EG-02) -----------------------
+        if num_matches < self.config.min_matches:
+            return EvidenceGateResult(
+                passed=False,
+                rejection_reason="insufficient_matches",
+                evidence_score=0.0,
+                diagnostics={
+                    "num_matches": num_matches,
+                    "min_matches": self.config.min_matches,
+                },
+            )
 
-        # TODO (M3-EG-04): Compute normalised match-count signal score.
-        #   score = min(1.0, num_matches / config.match_count_saturation)
+        # ---- 3. Hard: M2 confidence threshold (M3-EG-03) -------------------
+        if confidence < self.config.min_confidence:
+            return EvidenceGateResult(
+                passed=False,
+                rejection_reason="low_m2_confidence",
+                evidence_score=0.0,
+                diagnostics={
+                    "confidence": confidence,
+                    "min_confidence": self.config.min_confidence,
+                },
+            )
 
-        # TODO (M3-EG-05): Compute spatial spread signal from source_points.
-        #   Suggested metric: std of point coordinates normalised by image
-        #   bounding box diagonal.  Use _compute_spatial_spread() helper.
-        #   Apply hard gate if spread < config.min_spatial_spread.
+        # ---- 4. Normalised match-count signal (M3-EG-04) -------------------
+        count_score: float = min(
+            1.0, num_matches / max(self.config.match_count_saturation, 1)
+        )
 
-        # TODO (M3-EG-06): Compute composite evidence score as weighted sum
-        #   of count_score, confidence, and spread_score using config weights.
-        #   Normalise so weights sum to 1.0.
+        # ---- 5. Spatial spread signal (M3-EG-05) ---------------------------
+        spread_score: float = self._compute_spatial_spread(source_points)
+        if spread_score < self.config.min_spatial_spread:
+            return EvidenceGateResult(
+                passed=False,
+                rejection_reason="insufficient_spatial_spread",
+                evidence_score=0.0,
+                diagnostics={
+                    "spread_score": spread_score,
+                    "min_spatial_spread": self.config.min_spatial_spread,
+                },
+            )
 
-        # TODO (M3-EG-07): Apply final composite threshold gate.
-        #   If evidence_score < config.min_evidence_score, return with
-        #   rejection_reason = "low_composite_evidence".
+        # ---- 6. Composite evidence score (M3-EG-06) ------------------------
+        w_conf  = max(0.0, self.config.confidence_weight)
+        w_spread = max(0.0, self.config.spread_weight)
+        w_count = max(0.0, self.config.match_count_weight)
+        total_w = w_conf + w_spread + w_count
+        if total_w <= 0.0:
+            total_w = 1.0  # guard against all-zero config
 
-        # TODO (M3-EG-08): On pass, return EvidenceGateResult(passed=True,
-        #   rejection_reason=None, evidence_score=..., diagnostics={...}).
+        evidence_score: float = float(
+            (w_conf * confidence + w_spread * spread_score + w_count * count_score)
+            / total_w
+        )
+        evidence_score = max(0.0, min(1.0, evidence_score))
 
-        raise NotImplementedError(
-            "EvidenceGate.evaluate() is not yet implemented (M3 TODO)."
+        # ---- 7. Final composite threshold gate (M3-EG-07) ------------------
+        if evidence_score < self.config.min_evidence_score:
+            return EvidenceGateResult(
+                passed=False,
+                rejection_reason="low_composite_evidence",
+                evidence_score=evidence_score,
+                diagnostics={
+                    "evidence_score": evidence_score,
+                    "min_evidence_score": self.config.min_evidence_score,
+                    "count_score": count_score,
+                    "confidence": confidence,
+                    "spread_score": spread_score,
+                },
+            )
+
+        # ---- 8. Pass (M3-EG-08) -------------------------------------------
+        return EvidenceGateResult(
+            passed=True,
+            rejection_reason=None,
+            evidence_score=evidence_score,
+            diagnostics={
+                "num_matches": num_matches,
+                "confidence": confidence,
+                "count_score": count_score,
+                "spread_score": spread_score,
+                "evidence_score": evidence_score,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -203,15 +263,35 @@ class EvidenceGate:
             Spread score ∈ [0, 1].  0 = all points coincident, 1 = maximum
             spread covering the normalisation area.
         """
-        # TODO (M3-EG-SPREAD-01): Handle degenerate case N < 2 → return 0.0.
-        # TODO (M3-EG-SPREAD-02): Compute point bounding box and area.
-        # TODO (M3-EG-SPREAD-03): Normalise by image area if image_shape given,
-        #   else normalise by max possible bounding box.
-        # TODO (M3-EG-SPREAD-04): Optionally use mean nearest-neighbour
-        #   distance as a more robust spread proxy.
-        raise NotImplementedError(
-            "_compute_spatial_spread() is not yet implemented (M3 TODO)."
-        )
+        # M3-EG-SPREAD-01: Handle degenerate cases
+        if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < 2:
+            return 0.0
+
+        # M3-EG-SPREAD-02: Compute bounding box dimensions
+        x_min, x_max = float(points[:, 0].min()), float(points[:, 0].max())
+        y_min, y_max = float(points[:, 1].min()), float(points[:, 1].max())
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+
+        # M3-EG-SPREAD-03: Normalise spread by image diagonal (or bbox diagonal)
+        if image_shape is not None:
+            h, w = float(image_shape[0]), float(image_shape[1])
+            diagonal = float(np.sqrt(h ** 2 + w ** 2))
+        else:
+            diagonal = float(np.sqrt(x_range ** 2 + y_range ** 2))
+
+        if diagonal < 1e-9:
+            return 0.0
+
+        # M3-EG-SPREAD-04: Use the mean std of x and y coordinates, normalised
+        # by half the diagonal (std of a uniform distribution over [0, D] ≈ D/sqrt(12))
+        std_x = float(np.std(points[:, 0]))
+        std_y = float(np.std(points[:, 1]))
+        mean_std = (std_x + std_y) / 2.0
+        # Normalise: max mean_std for uniform spread ≈ diagonal / (2 * sqrt(12))
+        normaliser = diagonal / (2.0 * float(np.sqrt(12.0)))
+        spread = float(np.clip(mean_std / max(normaliser, 1e-9), 0.0, 1.0))
+        return spread
 
     def _validate_correspondence_keys(self, correspondence: Dict[str, Any]) -> None:
         """Raise ValueError if required M2 keys are absent.
@@ -222,9 +302,18 @@ class EvidenceGate:
         Raises:
             ValueError: With list of missing keys.
         """
-        # TODO (M3-EG-KEYS-01): Define REQUIRED_KEYS tuple.
-        # TODO (M3-EG-KEYS-02): Compute missing = REQUIRED_KEYS - correspondence.keys().
-        # TODO (M3-EG-KEYS-03): Raise ValueError if missing is non-empty.
-        raise NotImplementedError(
-            "_validate_correspondence_keys() is not yet implemented (M3 TODO)."
+        # M3-EG-KEYS-01: Required M2 output keys
+        REQUIRED_KEYS = (
+            "source_points",
+            "reference_points",
+            "confidence",
+            "num_matches",
         )
+        # M3-EG-KEYS-02: Find missing keys
+        missing = [k for k in REQUIRED_KEYS if k not in correspondence]
+        # M3-EG-KEYS-03: Raise with descriptive message if any are absent
+        if missing:
+            raise ValueError(
+                f"correspondence dict is missing required M2 keys: {missing}. "
+                f"Got keys: {sorted(correspondence.keys())}"
+            )

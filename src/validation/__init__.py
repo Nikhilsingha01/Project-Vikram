@@ -47,22 +47,52 @@ M2 Data Contract (READ-ONLY — do NOT modify M2 modules):
         candidate_roi       : Dict — present when match_with_candidate_roi() was used
 """
 
+
 # ---------------------------------------------------------------------------
-# Public API — populated incrementally as sub-modules are implemented.
+# Public API -- all M3 sub-modules are implemented.
 # ---------------------------------------------------------------------------
 
-# TODO (M3): uncomment and extend as each sub-module is implemented.
-# from src.validation.evidence_gate import EvidenceGate, EvidenceGateConfig
-# from src.validation.geometric_estimation import (
-#     GeometricEstimator,
-#     EstimationResult,
-#     TransformModel,
-# )
-# from src.validation.inlier_analysis import InlierAnalyzer, InlierReport
-# from src.validation.reprojection import compute_reprojection_errors, ReprojectionReport
-# from src.validation.registration import register_image, RegistrationResult
-# from src.validation.metrics import ValidationMetrics, compute_validation_metrics
+from src.validation.evidence_gate import (
+    EvidenceGate,
+    EvidenceGateConfig,
+    EvidenceGateResult,
+)
+from src.validation.geometric_estimation import (
+    GeometricEstimator,
+    GeometricEstimatorConfig,
+    EstimationResult,
+    TransformModel,
+)
+from src.validation.inlier_analysis import (
+    InlierAnalyzer,
+    InlierReport,
+    analyse_inliers,
+)
+from src.validation.reprojection import (
+    compute_reprojection_errors,
+    ReprojectionReport,
+)
+from src.validation.registration import (
+    register_image,
+    RegistrationConfig,
+    RegistrationResult,
+)
+from src.validation.metrics import (
+    ValidationMetrics,
+    compute_validation_metrics,
+    MetricsWeights,
+    DecisionThresholds,
+    summarise_batch_metrics,
+    ACCEPT,
+    REJECT,
+)
 
 __all__: list = [
-    # Populated once sub-modules are implemented.
+    "EvidenceGate", "EvidenceGateConfig", "EvidenceGateResult",
+    "GeometricEstimator", "GeometricEstimatorConfig", "EstimationResult", "TransformModel",
+    "InlierAnalyzer", "InlierReport", "analyse_inliers",
+    "compute_reprojection_errors", "ReprojectionReport",
+    "register_image", "RegistrationConfig", "RegistrationResult",
+    "ValidationMetrics", "compute_validation_metrics", "MetricsWeights",
+    "DecisionThresholds", "summarise_batch_metrics", "ACCEPT", "REJECT",
 ]
