@@ -1,0 +1,33 @@
+Reference Image Metadata
+========================
+
+File: LRO_gray.png
+Driver: PNG/Portable Network Graphics
+
+Size:
+Width  = 1244 pixels
+Height = 617 pixels
+
+Data Type:
+Byte
+
+Color:
+Grayscale
+
+Coordinate System:
+Not defined
+
+Georeferencing:
+Not defined
+
+Image Coordinates:
+Upper Left  = (0, 0)
+Upper Right = (1244, 0)
+Lower Left  = (0, 617)
+Lower Right = (1244, 617)
+Center      = (622, 308.5)
+
+Band:
+Band 1
+Block Size = 1244 x 1
+ColorInterp = Gray
