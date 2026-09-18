@@ -1,1 +1,7 @@
+<<<<<<< HEAD
 pyproj
+=======
+numpy
+opencv-python
+pytest
+>>>>>>> 4b76279a1fd203b920466024eae3fb4f07cdcda7
