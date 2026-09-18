@@ -925,6 +925,26 @@ streamlit run app/streamlit_app.py
 
 The application will provide the interactive FLUX registration interface.
 
+## Run the MVP
+
+From the project root, create and activate the virtual environment if needed,
+then install the dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Launch the complete Streamlit MVP with:
+
+```bash
+./run.sh
+```
+
+Open the URL shown by Streamlit. The app includes the repository's prototype
+images, so the pipeline can be run without a browser upload.
+
 🧪 Running Tests
 
 Run the complete test suite using:

@@ -6,18 +6,25 @@ import streamlit as st
 
 
 def display_processing_status(steps: Optional[Iterable[Dict[str, str]]]) -> None:
-    """Render pipeline stages and their current state."""
-    st.subheader("Processing Pipeline")
+    """Render user-facing registration stages and their current state."""
+    st.subheader("Registration Processing")
     if not steps:
         st.info("Processing has not started.")
         return
+    stage_names = {
+        "M1": "Candidate Search",
+        "M2": "Feature Matching",
+        "M3": "Geometric Verification",
+        "M4": "Sub-pixel Refinement",
+    }
     for step in steps:
+        name = step.get("name", "").upper()
+        if name == "PIPELINE":
+            continue
         status = step.get("status", "unknown")
-        icon = {"completed": "✅", "not_implemented": "○", "failed": "❌"}.get(
-            status, "•"
-        )
+        icon = {"completed": "✓", "not_implemented": "○", "failed": "✕"}.get(status, "•")
         detail = step.get("detail")
-        label = f"{icon} {step.get('name', 'Unnamed stage')}"
+        label = f"{icon} {stage_names.get(name, step.get('name', 'Unnamed stage'))}"
         st.write(label)
         if detail:
             st.caption(detail)
@@ -29,40 +36,59 @@ def display_image_comparison(
     registered_image: Any = None,
 ) -> None:
     """Render available source, reference, and registered images."""
-    st.subheader("Images")
+    st.subheader("Image Comparison")
     columns = st.columns(3 if registered_image is not None else 2)
     with columns[0]:
-        st.image(source_image, caption="Source Image", use_container_width=True)
+        st.image(source_image, caption="Source Image", width="stretch")
     with columns[1]:
-        st.image(reference_image, caption="Reference Image", use_container_width=True)
+        st.image(reference_image, caption="Reference Image", width="stretch")
     if registered_image is not None:
         with columns[2]:
             st.image(
                 registered_image,
                 caption="Registered Image",
-                use_container_width=True,
+                width="stretch",
             )
-    else:
-        st.info("A registered image will appear here after real registration is connected.")
 
 
 def display_metrics(result: Dict[str, Any]) -> None:
-    """Render registration metrics, including unavailable values safely."""
+    """Render the registration metrics using real pipeline values."""
     st.subheader("Registration Metrics")
-    metrics = (
-        ("RMSE", result.get("rmse")),
-        ("Mean Error", result.get("mean_error")),
-        ("Maximum Error", result.get("max_error")),
-        ("Matches", result.get("matches")),
-        ("Inliers", result.get("inliers")),
-        ("Inlier Ratio", result.get("inlier_ratio")),
-        ("Confidence", result.get("confidence")),
-    )
-    columns = st.columns(4)
-    for index, (label, value) in enumerate(metrics):
-        with columns[index % len(columns)]:
-            display_value = "Unavailable" if value is None else value
-            st.metric(label, display_value)
+    matches = result.get("matches")
+    inliers = result.get("inliers")
+    inlier_ratio = result.get("inlier_ratio")
+    if inlier_ratio is None and matches:
+        inlier_ratio = float(inliers) / float(matches)
+
+    def format_count(value: Any) -> str:
+        return "N/A" if value is None else f"{int(value)}"
+
+    def format_percent(value: Any) -> str:
+        return "N/A" if value is None else f"{float(value):.1%}"
+
+    def format_error(value: Any) -> str:
+        return "N/A" if value is None else f"{float(value):.2f} px"
+
+    with st.container(border=True):
+        first_row = st.columns(2)
+        with first_row[0]:
+            st.metric("Feature Matches", format_count(matches))
+        with first_row[1]:
+            st.metric("Verified Inliers", format_count(inliers))
+
+        second_row = st.columns(2)
+        with second_row[0]:
+            st.metric("Inlier Ratio", format_percent(inlier_ratio))
+        with second_row[1]:
+            st.metric("Confidence", format_percent(result.get("confidence")))
+
+        third_row = st.columns(2)
+        with third_row[0]:
+            st.metric("RMSE", format_error(result.get("rmse")))
+        with third_row[1]:
+            st.metric("Mean Error", format_error(result.get("mean_error")))
+
+        st.metric("Maximum Error", format_error(result.get("max_error")))
 
 
 def display_match_status(result: Dict[str, Any]) -> None:
