@@ -1,24 +1,36 @@
-"""Streamlit entry point for the FLUX demonstration application."""
-
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Ensure repository root is on sys.path for Streamlit Community Cloud and local runs
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
-from app.components import (
-    display_image_comparison,
-    display_match_status,
-    display_metrics,
-    display_processing_status,
-)
-from app.pipeline import run_pipeline
+try:
+    from app.components import (
+        display_image_comparison,
+        display_match_status,
+        display_metrics,
+        display_processing_status,
+    )
+    from app.pipeline import run_pipeline
+except ModuleNotFoundError:
+    from components import (  # type: ignore
+        display_image_comparison,
+        display_match_status,
+        display_metrics,
+        display_processing_status,
+    )
+    from pipeline import run_pipeline  # type: ignore
 
 
 SUPPORTED_TYPES = ["png", "jpg", "jpeg", "tif", "tiff"]
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROTOTYPE_IMAGES = {
     "Chandrayaan-2 source": PROJECT_ROOT / "data/raw/lunar_reference/LRO/quickmap-lroc.png",
     "LRO reference": PROJECT_ROOT / "data/prepared/lunar_reference/LRO_gray.png",
