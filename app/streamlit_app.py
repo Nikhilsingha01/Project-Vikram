@@ -44,52 +44,167 @@ def main() -> None:
         page_icon="🌙",
         layout="wide",
     )
+
+    st.markdown(
+        """
+        <style>
+            .stApp {
+                background: linear-gradient(180deg, #050b14 0%, #0a1220 45%, #071019 100%);
+            }
+            .main .block-container {
+                max-width: 1420px;
+                padding-top: 2rem;
+                padding-bottom: 2rem;
+            }
+            h1 {
+                margin-bottom: 0.15rem;
+                letter-spacing: 0.08em;
+                font-weight: 800;
+                color: #f4f8ff;
+                text-transform: uppercase;
+            }
+            .stCaption {
+                color: #9fb6d0 !important;
+                font-size: 0.92rem !important;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
+                margin-bottom: 1.2rem !important;
+            }
+            .stAlert, .stSuccess, .stWarning, .stInfo {
+                border-radius: 16px;
+                border: 1px solid rgba(96, 165, 250, 0.2);
+                background: rgba(15, 23, 42, 0.8);
+                box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.08), 0 18px 30px rgba(2, 6, 23, 0.28);
+            }
+            div[data-testid="stVerticalBlockBorderWrapper"] {
+                background: rgba(12, 18, 28, 0.78);
+                border: 1px solid rgba(96, 165, 250, 0.18);
+                border-radius: 18px;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 12px 28px rgba(2,6,23,0.22);
+                padding: 1rem 1rem 0.35rem 1rem;
+            }
+            [data-testid="stFileUploaderDropzone"] {
+                background: rgba(15, 23, 42, 0.72);
+                border: 1px dashed rgba(96, 165, 250, 0.38);
+                border-radius: 16px;
+            }
+            [data-testid="stFileUploaderDropzoneHover"] {
+                border-color: rgba(34, 211, 238, 0.8);
+                box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.25);
+            }
+            [data-testid="stRadio"] label,
+            [data-testid="stSelectbox"] label,
+            [data-testid="stFileUploader"] label,
+            [data-testid="stExpander"] summary {
+                color: #dfeaf6 !important;
+                font-weight: 600;
+            }
+            [data-testid="stSelectbox"] > div,
+            [data-testid="baseButton-secondary"],
+            [data-testid="stHorizontalBlock"] {
+                border-radius: 12px;
+            }
+            div[data-testid="stMetric"] {
+                background: rgba(11, 18, 29, 0.85);
+                border: 1px solid rgba(96, 165, 250, 0.18);
+                border-radius: 16px;
+                padding: 0.7rem 0.8rem;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+            }
+            div[data-testid="stMetric"] label {
+                color: #9fb6d0 !important;
+                font-weight: 600;
+            }
+            div[data-testid="stMetric"] div {
+                color: #f8fbff !important;
+                font-weight: 800;
+            }
+            [data-testid="stImage"] {
+                border-radius: 18px;
+                border: 1px solid rgba(96, 165, 250, 0.18);
+                box-shadow: 0 14px 26px rgba(2, 6, 23, 0.28);
+            }
+            .stButton > button {
+                background: linear-gradient(135deg, #f97316 0%, #ef4444 100%);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+                font-weight: 700;
+                color: #fff7ed;
+                box-shadow: 0 12px 22px rgba(239, 68, 68, 0.25);
+                transition: transform 0.18s ease, box-shadow 0.18s ease;
+            }
+            .stButton > button:hover {
+                box-shadow: 0 14px 30px rgba(249, 115, 22, 0.28);
+                transform: translateY(-1px);
+            }
+            .stButton > button:focus {
+                box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.32);
+            }
+            .stTabs [role="tablist"] {
+                gap: 0.6rem;
+            }
+            .stTabs [role="tab"] {
+                border-radius: 10px 10px 0 0;
+                padding: 0.55rem 0.85rem;
+            }
+            .stTabs [role="tab"][aria-selected="true"] {
+                background: rgba(8, 145, 178, 0.12);
+                color: #dff7ff;
+                border-bottom: 2px solid rgba(34, 211, 238, 0.8);
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("FLUX")
     st.caption("Lunar Image Registration & Localization")
     st.success("This app runs the real FLUX registration pipeline on the selected images.")
 
     source_upload, reference_upload = st.columns(2)
     with source_upload:
-        source_mode = st.radio(
-            "Source input",
-            ["Prototype image", "Upload image"],
-            horizontal=True,
-            key="source_mode",
-        )
-        source_prototype = None
-        if source_mode == "Prototype image":
-            source_prototype = st.selectbox(
-                "Source prototype",
-                list(PROTOTYPE_IMAGES),
-                key="source_prototype",
+        with st.container(border=True):
+            source_mode = st.radio(
+                "Source input",
+                ["Prototype image", "Upload image"],
+                horizontal=True,
+                key="source_mode",
             )
-        source_file = st.file_uploader(
-            "Source image",
-            type=SUPPORTED_TYPES,
-            key="source_image",
-            disabled=source_mode == "Prototype image",
-        )
+            source_prototype = None
+            if source_mode == "Prototype image":
+                source_prototype = st.selectbox(
+                    "Source prototype",
+                    list(PROTOTYPE_IMAGES),
+                    key="source_prototype",
+                )
+            source_file = st.file_uploader(
+                "Source image",
+                type=SUPPORTED_TYPES,
+                key="source_image",
+                disabled=source_mode == "Prototype image",
+            )
     with reference_upload:
-        reference_mode = st.radio(
-            "Reference input",
-            ["Prototype image", "Upload image"],
-            horizontal=True,
-            key="reference_mode",
-        )
-        reference_prototype = None
-        if reference_mode == "Prototype image":
-            reference_prototype = st.selectbox(
-                "Reference prototype",
-                list(PROTOTYPE_IMAGES),
-                index=1,
-                key="reference_prototype",
+        with st.container(border=True):
+            reference_mode = st.radio(
+                "Reference input",
+                ["Prototype image", "Upload image"],
+                horizontal=True,
+                key="reference_mode",
             )
-        reference_file = st.file_uploader(
-            "Reference image",
-            type=SUPPORTED_TYPES,
-            key="reference_image",
-            disabled=reference_mode == "Prototype image",
-        )
+            reference_prototype = None
+            if reference_mode == "Prototype image":
+                reference_prototype = st.selectbox(
+                    "Reference prototype",
+                    list(PROTOTYPE_IMAGES),
+                    index=1,
+                    key="reference_prototype",
+                )
+            reference_file = st.file_uploader(
+                "Reference image",
+                type=SUPPORTED_TYPES,
+                key="reference_image",
+                disabled=reference_mode == "Prototype image",
+            )
 
     source_image = _read_selected_image(
         source_file,

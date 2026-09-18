@@ -25,9 +25,10 @@ def display_processing_status(steps: Optional[Iterable[Dict[str, str]]]) -> None
         icon = {"completed": "✓", "not_implemented": "○", "failed": "✕"}.get(status, "•")
         detail = step.get("detail")
         label = f"{icon} {stage_names.get(name, step.get('name', 'Unnamed stage'))}"
-        st.write(label)
-        if detail:
-            st.caption(detail)
+        with st.container(border=True):
+            st.markdown(f"<div style='display:flex; align-items:center; gap:0.7rem; color:#eef6ff; font-weight:600; padding:0.1rem 0;'> <span style='color:#67e8f9; font-size:1.05rem;'>{icon}</span> <span>{label}</span></div>", unsafe_allow_html=True)
+            if detail:
+                st.caption(detail)
 
 
 def display_image_comparison(
